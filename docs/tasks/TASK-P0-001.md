@@ -52,3 +52,21 @@ Before editing, output:
 3. Risks or ambiguities you found.
 
 Then implement the task, actually run the acceptance commands, and finish with the Task Completion Report required by `CODEX.md`.
+代码注释要求：
+
+1. 对关键架构逻辑添加简洁中文注释。
+2. 注释重点解释“为什么这样设计”，不要只重复代码做了什么。
+3. 以下场景必须注释：
+   - Middleware / ContextVar 生命周期
+   - 缓存与单例
+   - 幂等处理
+   - 异常与降级策略
+   - 权限与安全检查
+   - 状态机转换
+   - Tool 调用边界
+   - HITL 高风险操作
+   - 数据库事务
+   - 重试 / 超时
+   - 不直观的兼容性处理
+4. 不要对显而易见的赋值、循环、简单 if 做逐行注释。
+5. 注释默认使用中文，代码标识符保持英文。
