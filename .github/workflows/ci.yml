@@ -7,6 +7,20 @@ on:
 jobs:
   backend:
     runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_DB: enterprise_agent
+          POSTGRES_USER: enterprise_agent
+          POSTGRES_PASSWORD: change_me
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U enterprise_agent -d enterprise_agent"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
     defaults:
       run:
         working-directory: backend
@@ -18,6 +32,7 @@ jobs:
       - run: uv sync --locked
       - run: uv run ruff check .
       - run: uv run ruff format --check .
+      - run: uv run alembic upgrade head
       - run: uv run pytest
 
   frontend:

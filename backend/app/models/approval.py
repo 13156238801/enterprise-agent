@@ -7,8 +7,8 @@ from uuid import UUID, uuid4
 from sqlalchemy import DateTime, Enum, ForeignKey, Index, Integer, String, Text, func, text
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
+from app.domain.approval.enums import ApprovalAction, ApprovalStatus, BusinessType
 from app.infrastructure.database import Base
-from app.models.enums import ApprovalAction, ApprovalStatus, BusinessType
 
 if TYPE_CHECKING:
     from app.models.master_data import MasterDataChange
