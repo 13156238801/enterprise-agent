@@ -4,15 +4,17 @@ from logging.config import fileConfig
 from sqlalchemy import pool
 from sqlalchemy.ext.asyncio import create_async_engine
 
+import app.models  # noqa: F401
 from alembic import context
 from app.core.config import get_settings
-from app.infrastructure.database import Base, database_url
+from app.infrastructure.database import database_url
+from app.models import Base
 
 config = context.config
 if config.config_file_name is not None:
     fileConfig(config.config_file_name)
 
-# Migration 與 runtime 共用空的 Base metadata 和 URL builder，避免 schema/凭据实现分叉。
+# Migration 與 runtime 共用同一套 Base metadata 和 database URL builder，避免定义分叉。
 target_metadata = Base.metadata
 
 

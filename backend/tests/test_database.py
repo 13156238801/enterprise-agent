@@ -54,4 +54,8 @@ def test_engine_and_factory_are_async_and_sessions_are_independent() -> None:
     assert isinstance(engine, AsyncEngine)
     assert isinstance(factory, async_sessionmaker)
     assert factory() is not factory()
-    assert Base.metadata.tables == {}
+    assert set(Base.metadata.tables) == {
+        "approval_application",
+        "approval_record",
+        "master_data_change",
+    }
