@@ -2,6 +2,7 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Literal
 
+from pydantic import SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
@@ -19,6 +20,14 @@ class Settings(BaseSettings):
     app_env: Literal["development", "test", "production"] = "development"
     log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"] = "INFO"
     request_id_header: str = "X-Request-ID"
+    postgres_db: str = "enterprise_agent"
+    postgres_user: str = "enterprise_agent"
+    postgres_password: SecretStr = SecretStr("change_me")
+    postgres_host: str = "localhost"
+    postgres_port: int = 5432
+    redis_host: str = "localhost"
+    redis_port: int = 6379
+    redis_db: int = 0
 
 
 @lru_cache(maxsize=1)

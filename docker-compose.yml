@@ -4,7 +4,7 @@ services:
     environment:
       POSTGRES_DB: ${POSTGRES_DB:-enterprise_agent}
       POSTGRES_USER: ${POSTGRES_USER:-enterprise_agent}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-replace-with-local-password}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-change_me}
     ports:
       - "${POSTGRES_PORT:-5432}:5432"
     volumes:
