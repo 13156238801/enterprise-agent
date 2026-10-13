@@ -56,15 +56,16 @@ async def seed_demo_users(
                     session.add(UserRoleAssignment(user_id=user.id, role=role))
                     continue
                 else:
-                    hash_is_current = False
                     try:
-                        password_matches = await asyncio.to_thread(
-                            hasher.verify, password, user.password_hash
+                        password_matches, updated_hash = await asyncio.to_thread(
+                            hasher.verify_and_update, password, user.password_hash
                         )
-                        hash_is_current = not hasher.needs_rehash(user.password_hash)
                     except (ValueError, TypeError):
                         password_matches = False
-                    if not password_matches or not hash_is_current:
+                        updated_hash = None
+                    if updated_hash is not None:
+                        user.password_hash = updated_hash
+                    elif not password_matches:
                         user.password_hash = await asyncio.to_thread(hasher.hash, password)
                     user.display_name = display_name
                     user.enabled = True
@@ -98,3 +99,4 @@ async def main() -> None:
 
 if __name__ == "__main__":
     asyncio.run(main())
+

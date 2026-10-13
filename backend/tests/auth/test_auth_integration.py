@@ -310,7 +310,7 @@ def test_auth_unique_role_check_and_relationship_constraints() -> None:
                 )
                 with pytest.raises(IntegrityError) as error_info:
                     await session.flush()
-                assert error_info.value.orig.constraint_name == "ck_user_roles_role"
+                assert 'check constraint "ck_user_roles_role"' in str(error_info.value.orig)
                 await session.rollback()
 
             async with factory() as session:
@@ -558,3 +558,4 @@ def test_demo_seed_is_idempotent_and_reconciles_exact_roles() -> None:
             await engine.dispose()
 
     asyncio.run(run())
+

@@ -26,9 +26,12 @@ class PasswordHasher:
         except (ValueError, TypeError):
             return False
 
-    def needs_rehash(self, password_hash: str) -> bool:
-        """判断现有摘要是否需要升级到当前哈希参数。"""
-        return self._hasher.check_needs_rehash(password_hash)
+    def verify_and_update(self, password: str, password_hash: str) -> tuple[bool, str | None]:
+        """验证密码并按 pwdlib API 返回可选的新摘要。"""
+        try:
+            return self._hasher.verify_and_update(password, password_hash)
+        except (ValueError, TypeError):
+            return False, None
 
 
 def normalize_username(username: str) -> str:
@@ -39,3 +42,4 @@ def normalize_username(username: str) -> str:
 def hash_bearer_token(raw_token: str) -> str:
     """将原始 Bearer Token 转为可索引的 SHA-256 十六进制摘要。"""
     return hashlib.sha256(raw_token.encode("utf-8")).hexdigest()
+

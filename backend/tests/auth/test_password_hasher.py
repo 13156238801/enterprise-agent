@@ -15,6 +15,15 @@ def test_argon2_hash_verifies_only_the_original_password() -> None:
     assert password_hash != hasher.hash("local-demo-password")
 
 
+def test_argon2_verify_and_update_reports_current_hash_without_rehash() -> None:
+    """验证密码匹配时哈希器正确报告是否需要升级摘要。"""
+    hasher = PasswordHasher()
+    password_hash = hasher.hash("local-demo-password")
+
+    assert hasher.verify_and_update("local-demo-password", password_hash) == (True, None)
+    assert hasher.verify_and_update("wrong-password", password_hash) == (False, None)
+
+
 def test_username_normalization_strips_and_lowercases() -> None:
     """验证用户名统一去除首尾空白并转为小写。"""
     assert normalize_username(" Manager ") == "manager"
@@ -33,3 +42,4 @@ def test_user_role_enum_contains_only_approved_roles() -> None:
         "DATA_ADMIN",
         "ADMIN",
     ]
+
