@@ -42,4 +42,3 @@ def test_user_role_enum_contains_only_approved_roles() -> None:
         "DATA_ADMIN",
         "ADMIN",
     ]
-

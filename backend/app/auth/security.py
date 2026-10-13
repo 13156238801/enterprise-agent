@@ -42,4 +42,3 @@ def normalize_username(username: str) -> str:
 def hash_bearer_token(raw_token: str) -> str:
     """将原始 Bearer Token 转为可索引的 SHA-256 十六进制摘要。"""
     return hashlib.sha256(raw_token.encode("utf-8")).hexdigest()
-
