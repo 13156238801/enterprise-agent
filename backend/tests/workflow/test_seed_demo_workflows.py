@@ -112,12 +112,12 @@ def test_postgres_workflow_seed_is_idempotent_and_preserves_version_history(monk
             with pytest.raises(RuntimeError, match="create a new version"):
                 await seed_module.seed_demo_workflows(settings, factory)
 
-            later_v2 = WorkflowDefinitionSpec(
+            retroactive_expected = WorkflowDefinitionSpec(
                 code=other_code,
-                version=2,
-                nodes=(WorkflowNodeDefinition("later_review", UserRole.DATA_ADMIN),),
+                version=1,
+                nodes=(WorkflowNodeDefinition("initial_review", UserRole.APPROVER),),
             )
-            monkeypatch.setattr(seed_module, "_DEMO_WORKFLOW", later_v2)
+            monkeypatch.setattr(seed_module, "_DEMO_WORKFLOW", retroactive_expected)
             async with factory() as session:
                 session.add(
                     WorkflowDefinition(
