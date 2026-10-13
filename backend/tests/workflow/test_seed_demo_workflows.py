@@ -12,6 +12,7 @@ from app.domain.auth.enums import UserRole
 from app.domain.workflow.definition import WorkflowDefinitionSpec, WorkflowNodeDefinition
 from app.infrastructure.database import create_db_engine, create_session_factory
 from app.models.workflow import WorkflowDefinition
+from app.workflow.repository import WorkflowDefinitionRepository
 from scripts import seed_demo_workflows as seed_module
 
 
@@ -142,6 +143,53 @@ def test_postgres_workflow_seed_is_idempotent_and_preserves_version_history(monk
                     )
                 )
                 await session.commit()
+            await engine.dispose()
+
+    asyncio.run(run())
+
+
+def test_postgres_workflow_seed_rolls_back_after_repository_flush(monkeypatch) -> None:
+    """验证 Repository flush 后的 Seed 异常会回滚所有数据库写入。"""
+    code = f"seed_rollback_{uuid4().hex[:16]}"
+    spec = WorkflowDefinitionSpec(
+        code=code,
+        version=1,
+        nodes=(WorkflowNodeDefinition("manager_review", UserRole.APPROVER),),
+    )
+    settings = Settings(_env_file=None, app_env="test")
+    engine = create_db_engine(settings)
+    factory = create_session_factory(engine)
+    original_add = WorkflowDefinitionRepository.add
+    monkeypatch.setattr(seed_module, "_DEMO_WORKFLOW", spec)
+
+    async def add_then_fail(
+        repository: WorkflowDefinitionRepository,
+        definition: WorkflowDefinitionSpec,
+        *,
+        active: bool = False,
+    ) -> WorkflowDefinition:
+        """先真实 flush 工作流行，再注入故障触发 Seed 外层事务回滚。"""
+        await original_add(repository, definition, active=active)
+        raise RuntimeError("injected seed failure")
+
+    monkeypatch.setattr(WorkflowDefinitionRepository, "add", add_then_fail)
+
+    async def run() -> None:
+        """执行故障注入并用独立 Session 检查没有残留行。"""
+        try:
+            with pytest.raises(RuntimeError, match="injected seed failure"):
+                await seed_module.seed_demo_workflows(settings, factory)
+
+            async with factory() as session:
+                rows = list(
+                    (
+                        await session.scalars(
+                            select(WorkflowDefinition).where(WorkflowDefinition.code == code)
+                        )
+                    ).all()
+                )
+                assert rows == []
+        finally:
             await engine.dispose()
 
     asyncio.run(run())
