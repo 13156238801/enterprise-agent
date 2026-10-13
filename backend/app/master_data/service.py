@@ -161,6 +161,8 @@ class MasterDataService:
 
             # 新 patch 累加在现有 after；before 和基线版本固定，避免隐式 rebase。
             after = _apply_domain(lambda: apply_master_data_patch(change.form_data, changes))
+            if after == change.form_data:
+                raise MasterDataError(MasterDataErrorCode.NO_CHANGE)
             before = _apply_domain(lambda: validate_json_object(change.before_data, "before_data"))
             # 每次对原始 before 重算完整 Diff；并发版本冲突留给 P1-010 执行。
             diff = _apply_domain(lambda: build_master_data_diff(before, after))

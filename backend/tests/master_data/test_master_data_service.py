@@ -177,6 +177,10 @@ def test_postgres_create_and_iterative_update_preserve_original_snapshots() -> N
                     .where(ApprovalRecord.approval_id == first.approval_id)
                 )
                 assert count == 3
+                unchanged = await session.get(MasterDataChange, first.change_id)
+                assert unchanged is not None
+                assert unchanged.form_data == third.after
+                assert unchanged.change_reason == third.reason
 
             async with factory() as session:
                 with pytest.raises(MasterDataError) as error:
