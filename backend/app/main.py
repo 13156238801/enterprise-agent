@@ -7,6 +7,8 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 from sqlalchemy import text
 
+from app.api.errors import register_error_handlers
+from app.api.v1.auth import router as auth_router
 from app.core.config import get_settings
 from app.core.logging import configure_logging
 from app.core.request_context import RequestIdMiddleware
@@ -53,6 +55,9 @@ def create_app(app_settings=settings) -> FastAPI:
             await _close_resources(application)
 
     api = FastAPI(title="Enterprise Agent API", version="0.1.0", lifespan=lifespan)
+    api.state.settings = app_settings
+    api.include_router(auth_router)
+    register_error_handlers(api)
 
     @api.get("/health", tags=["health"])
     async def health() -> dict[str, str]:
