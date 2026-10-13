@@ -8,8 +8,11 @@ from app.models import (
     ApprovalApplication,
     ApprovalRecord,
     ApprovalStatus,
+    AuthSession,
     BusinessType,
     MasterDataChange,
+    User,
+    UserRoleAssignment,
 )
 
 
@@ -33,12 +36,15 @@ def test_approval_enum_values_are_stable() -> None:
     assert [item.value for item in BusinessType] == ["MASTER_DATA_CHANGE"]
 
 
-def test_metadata_contains_only_the_three_approval_domain_tables() -> None:
-    """验证共享 ORM metadata 仅注册本任务授权的三张业务表。"""
+def test_metadata_contains_approval_and_auth_tables() -> None:
+    """验证共享 ORM metadata 同时注册审批表和认证表。"""
     assert set(Base.metadata.tables) == {
         "approval_application",
         "approval_record",
         "master_data_change",
+        "users",
+        "user_roles",
+        "auth_sessions",
     }
 
 
@@ -161,3 +167,44 @@ def test_all_datetime_columns_are_timezone_aware_and_share_defaults() -> None:
                 if column.name in {"created_at", "updated_at"}:
                     assert column.server_default is not None
                     assert "now()" in str(column.server_default.arg).lower()
+
+
+def test_auth_models_have_expected_constraints_and_timezone_columns() -> None:
+    """验证认证模型键、非级联关系和 timezone-aware 会话时钟字段。"""
+    assert User.__table__.c.id.primary_key
+    assert User.__table__.c.username.type.length == 64
+    assert User.__table__.c.display_name.type.length == 128
+    assert User.__table__.c.password_hash.type.length == 255
+    assert any(
+        isinstance(constraint, UniqueConstraint)
+        and {column.name for column in constraint.columns} == {"username"}
+        for constraint in User.__table__.constraints
+    )
+    assert UserRoleAssignment.__table__.primary_key.columns.keys() == ["user_id", "role"]
+    role_type = UserRoleAssignment.__table__.c.role.type
+    assert isinstance(role_type, SqlEnum)
+    assert not role_type.native_enum
+    assert role_type.create_constraint
+    assert role_type.name == "ck_user_roles_role"
+    assert role_type.length == 32
+    assert AuthSession.__table__.c.token_hash.type.length == 64
+    assert AuthSession.__table__.c.token_hash.unique is None
+    for model, fk_column in ((UserRoleAssignment, "user_id"), (AuthSession, "user_id")):
+        foreign_key = next(iter(model.__table__.c[fk_column].foreign_keys))
+        assert foreign_key.ondelete is None
+    for relationship in (
+        User.role_assignments.property,
+        User.auth_sessions.property,
+        UserRoleAssignment.user.property,
+        AuthSession.user.property,
+    ):
+        assert "delete" not in relationship.cascade
+        assert "delete-orphan" not in relationship.cascade
+    for table in (User.__table__, AuthSession.__table__):
+        for column in table.columns:
+            if isinstance(column.type, DateTime):
+                assert column.type.timezone
+    assert {index.name for index in AuthSession.__table__.indexes} == {
+        "ix_auth_sessions_user_id",
+        "ix_auth_sessions_expires_at",
+    }

@@ -1,7 +1,8 @@
 from sqlalchemy.ext.asyncio import AsyncEngine, async_sessionmaker
 
 from app.core.config import Settings
-from app.infrastructure.database import Base, create_db_engine, create_session_factory, database_url
+from app.infrastructure.database import create_db_engine, create_session_factory, database_url
+from app.models import Base
 
 
 def test_settings_defaults_and_environment_overrides(monkeypatch) -> None:
@@ -58,4 +59,7 @@ def test_engine_and_factory_are_async_and_sessions_are_independent() -> None:
         "approval_application",
         "approval_record",
         "master_data_change",
+        "users",
+        "user_roles",
+        "auth_sessions",
     }
