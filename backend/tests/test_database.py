@@ -59,6 +59,7 @@ def test_engine_and_factory_are_async_and_sessions_are_independent() -> None:
         "approval_application",
         "approval_record",
         "master_data_change",
+        "master_data_entities",
         "users",
         "user_roles",
         "auth_sessions",

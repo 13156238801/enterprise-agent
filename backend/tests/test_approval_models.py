@@ -46,6 +46,7 @@ def test_metadata_contains_approval_and_auth_tables() -> None:
         "user_roles",
         "auth_sessions",
         "workflow_definitions",
+        "master_data_entities",
     }
 
 
@@ -79,7 +80,7 @@ def test_external_identifiers_use_string_lengths_without_business_id_unique() ->
         (ApprovalRecord, "target_task_id"),
         (ApprovalRecord, "target_node_code"),
         (ApprovalRecord, "target_operator_id"),
-        (MasterDataChange, "entity_id"),
+        (MasterDataChange, "entity_key"),
     }
     for model, column_name in string_128_columns:
         assert model.__table__.c[column_name].type.length == 128

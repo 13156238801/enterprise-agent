@@ -34,6 +34,13 @@ jobs:
       - run: uv run ruff format --check .
       - run: uv run alembic upgrade head
       - run: uv run alembic check
+      - run: uv run alembic downgrade d1f004a203bc
+      - name: Verify P1-005 downgrade and prepare legacy backfill row
+        run: uv run python -m scripts.prepare_p1_005_backfill
+      - run: uv run alembic upgrade head
+      - name: Verify P1-005 legacy backfill
+        run: uv run python -m scripts.verify_p1_005_backfill
+      - run: uv run alembic check
       - run: uv run alembic downgrade b15a8d09c2f1
       - name: Verify P1-004 downgrade preserves previous tables
         run: uv run python -m scripts.verify_workflow_downgrade
@@ -48,6 +55,10 @@ jobs:
         env:
           APP_ENV: test
         run: uv run python -m scripts.seed_demo_workflows
+      - name: Seed demo master data
+        env:
+          APP_ENV: test
+        run: uv run python -m scripts.seed_demo_master_data
 
   frontend:
     runs-on: ubuntu-latest

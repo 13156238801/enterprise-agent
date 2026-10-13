@@ -3,6 +3,7 @@ from fastapi.responses import JSONResponse
 
 from app.auth.errors import AuthErrorCode
 from app.core.errors import AppError, ErrorEnvelope, ErrorInfo
+from app.master_data.errors import MasterDataErrorCode
 
 _AUTH_HTTP_STATUS = {
     AuthErrorCode.INVALID_CREDENTIALS.value: 401,
@@ -11,11 +12,20 @@ _AUTH_HTTP_STATUS = {
     AuthErrorCode.USER_DISABLED.value: 403,
     AuthErrorCode.PERMISSION_DENIED.value: 403,
 }
+_MASTER_DATA_HTTP_STATUS = {
+    MasterDataErrorCode.NOT_FOUND.value: 404,
+    MasterDataErrorCode.INVALID_CHANGE.value: 422,
+    MasterDataErrorCode.NO_CHANGE.value: 422,
+    MasterDataErrorCode.DRAFT_NOT_FOUND.value: 404,
+    MasterDataErrorCode.DRAFT_NOT_EDITABLE.value: 409,
+    MasterDataErrorCode.DRAFT_FORBIDDEN.value: 403,
+    MasterDataErrorCode.DRAFT_ENTITY_MISMATCH.value: 409,
+}
 
 
 async def app_error_handler(request: Request, error: AppError) -> JSONResponse:
     """仅在 HTTP 边界把应用错误映射为统一 Envelope 和状态码。"""
-    status_code = _AUTH_HTTP_STATUS.get(error.code, 500)
+    status_code = _AUTH_HTTP_STATUS.get(error.code, _MASTER_DATA_HTTP_STATUS.get(error.code, 500))
     headers = {"WWW-Authenticate": "Bearer"} if status_code == 401 else None
     request_id = getattr(request.state, "request_id", "")
     envelope = ErrorEnvelope(
