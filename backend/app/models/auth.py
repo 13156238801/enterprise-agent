@@ -58,6 +58,7 @@ class UserRoleAssignment(Base):
             name="ck_user_roles_role",
             native_enum=False,
             create_constraint=True,
+            length=32,
             values_callable=lambda enum_class: [item.value for item in enum_class],
         ),
         primary_key=True,

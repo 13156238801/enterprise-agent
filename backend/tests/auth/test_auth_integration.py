@@ -308,8 +308,9 @@ def test_auth_unique_role_check_and_relationship_constraints() -> None:
                 session.add(
                     UserRoleAssignment(user_id=user_id, role="INVALID_ROLE")  # type: ignore[arg-type]
                 )
-                with pytest.raises(IntegrityError):
+                with pytest.raises(IntegrityError) as error_info:
                     await session.flush()
+                assert error_info.value.orig.constraint_name == "ck_user_roles_role"
                 await session.rollback()
 
             async with factory() as session:

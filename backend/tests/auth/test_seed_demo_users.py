@@ -1,6 +1,7 @@
 """Demo 用户 seed 安全边界测试。"""
 
 import asyncio
+from unittest.mock import Mock
 
 import pytest
 from pydantic import SecretStr
@@ -30,3 +31,16 @@ def test_seed_requires_configured_demo_password() -> None:
         asyncio.run(
             seed_demo_users(Settings(_env_file=None, demo_user_password=None), None)  # type: ignore[arg-type]
         )
+
+
+def test_seed_rejects_empty_demo_password_before_database_access() -> None:
+    """验证空 DEMO_USER_PASSWORD 在调用 Session Factory 前被拒绝。"""
+    session_factory = Mock()
+    with pytest.raises(ValueError, match="DEMO_USER_PASSWORD"):
+        asyncio.run(
+            seed_demo_users(
+                Settings(_env_file=None, demo_user_password=SecretStr("")),
+                session_factory,
+            )
+        )
+    session_factory.assert_not_called()

@@ -186,6 +186,7 @@ def test_auth_models_have_expected_constraints_and_timezone_columns() -> None:
     assert not role_type.native_enum
     assert role_type.create_constraint
     assert role_type.name == "ck_user_roles_role"
+    assert role_type.length == 32
     assert AuthSession.__table__.c.token_hash.type.length == 64
     assert AuthSession.__table__.c.token_hash.unique is None
     for model, fk_column in ((UserRoleAssignment, "user_id"), (AuthSession, "user_id")):

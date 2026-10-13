@@ -49,6 +49,7 @@ def upgrade() -> None:
                 name="ck_user_roles_role",
                 native_enum=False,
                 create_constraint=False,
+                length=32,
             ),
             nullable=False,
         ),

@@ -28,9 +28,11 @@ async def seed_demo_users(
         raise RuntimeError("Demo seed is disabled in production")
     if settings.demo_user_password is None:
         raise ValueError("DEMO_USER_PASSWORD must be configured")
+    password = settings.demo_user_password.get_secret_value()
+    if not password:
+        raise ValueError("DEMO_USER_PASSWORD must not be empty")
 
     hasher = password_hasher or PasswordHasher()
-    password = settings.demo_user_password.get_secret_value()
     async with session_factory() as session:
         async with session.begin():
             for raw_username, display_name, role in _DEMO_USERS:
@@ -51,6 +53,8 @@ async def seed_demo_users(
                     )
                     session.add(user)
                     await session.flush()
+                    session.add(UserRoleAssignment(user_id=user.id, role=role))
+                    continue
                 else:
                     hash_is_current = False
                     try:
@@ -82,6 +86,8 @@ async def main() -> None:
         raise RuntimeError("Demo seed is disabled in production")
     if settings.demo_user_password is None:
         raise ValueError("DEMO_USER_PASSWORD must be configured")
+    if not settings.demo_user_password.get_secret_value():
+        raise ValueError("DEMO_USER_PASSWORD must not be empty")
     engine = create_db_engine(settings)
     try:
         count = await seed_demo_users(settings, create_session_factory(engine))

@@ -33,7 +33,15 @@ jobs:
       - run: uv run ruff check .
       - run: uv run ruff format --check .
       - run: uv run alembic upgrade head
+      - run: uv run alembic check
+      - run: uv run alembic downgrade 7aeecb191822
+      - run: uv run alembic upgrade head
       - run: uv run pytest
+      - name: Seed demo users
+        env:
+          APP_ENV: test
+          DEMO_USER_PASSWORD: "ci-demo-password-not-a-secret"
+        run: uv run python -m scripts.seed_demo_users
 
   frontend:
     runs-on: ubuntu-latest
