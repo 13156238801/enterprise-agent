@@ -10,6 +10,7 @@ from app.domain.approval.enums import ApprovalAction, ApprovalStatus, BusinessTy
 from app.domain.approval.errors import ApprovalTransitionError, ApprovalTransitionErrorCode
 from app.domain.approval.state_machine import decide_transition
 from app.domain.master_data.diff import (
+    JsonValue,
     MasterDataDiffItem,
     apply_master_data_patch,
     build_master_data_diff,
@@ -60,16 +61,15 @@ class MasterDataService:
     ) -> ChangeDraftResponse:
         """在事务中按 AuthContext 创建或更新主数据变更草稿。"""
         _validate_identity(entity_type, entity_key)
+        changes = _validated_changes(payload.changes)
         reason = _validated_reason(payload.reason)
         if payload.draft_approval_id is None:
-            return await self._create_draft(
-                entity_type, entity_key, payload.changes, reason, auth_context
-            )
+            return await self._create_draft(entity_type, entity_key, changes, reason, auth_context)
         return await self._update_draft(
             entity_type,
             entity_key,
             payload.draft_approval_id,
-            payload.changes,
+            changes,
             reason,
             auth_context,
         )
@@ -78,7 +78,7 @@ class MasterDataService:
         self,
         entity_type: str,
         entity_key: str,
-        changes: dict,
+        changes: dict[str, JsonValue],
         reason: str,
         auth_context: AuthContext,
     ) -> ChangeDraftResponse:
@@ -130,7 +130,7 @@ class MasterDataService:
         entity_type: str,
         entity_key: str,
         approval_id: UUID,
-        changes: dict,
+        changes: dict[str, JsonValue],
         reason: str,
         auth_context: AuthContext,
     ) -> ChangeDraftResponse:
@@ -213,7 +213,7 @@ def _reject_no_change(diff: tuple[MasterDataDiffItem, ...]) -> None:
         raise MasterDataError(MasterDataErrorCode.NO_CHANGE)
 
 
-def _validated_reason(reason: str) -> str:
+def _validated_reason(reason: object) -> str:
     """规范化并验证变更原因，限制为 1 至 2000 个字符。"""
     if not isinstance(reason, str):
         raise MasterDataError(MasterDataErrorCode.INVALID_CHANGE)
@@ -221,6 +221,17 @@ def _validated_reason(reason: str) -> str:
     if not 1 <= len(normalized) <= 2000:
         raise MasterDataError(MasterDataErrorCode.INVALID_CHANGE)
     return normalized
+
+
+def _validated_changes(changes: object) -> dict[str, JsonValue]:
+    """验证 patch 为非空的 JSON-compatible object 并统一转换应用错误。"""
+    try:
+        validated = validate_json_object(changes, "changes")
+    except MasterDataDomainError as error:
+        raise MasterDataError(MasterDataErrorCode.INVALID_CHANGE) from error
+    if not validated:
+        raise MasterDataError(MasterDataErrorCode.INVALID_CHANGE)
+    return validated
 
 
 def _diff_item_dict(item: MasterDataDiffItem) -> dict:

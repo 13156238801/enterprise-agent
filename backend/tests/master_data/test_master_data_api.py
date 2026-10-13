@@ -11,6 +11,7 @@ from app.core.request_context import RequestIdMiddleware
 from app.domain.auth.enums import UserRole
 from app.main import create_app
 from app.master_data.errors import MasterDataError, MasterDataErrorCode
+from app.master_data.service import MasterDataService
 
 
 def _auth_context(role: UserRole) -> AuthContext:
@@ -173,16 +174,76 @@ def test_draft_request_rejects_client_supplied_identity() -> None:
     assert response.status_code == 422
 
 
-def test_draft_request_rejects_non_object_changes_as_validation_error() -> None:
-    """验证非 object 的 changes 作为请求校验错误返回 422。"""
+def test_invalid_changes_use_master_data_error_envelope() -> None:
+    """验证无效 changes 经主数据应用错误返回统一 Envelope 和 Request ID。"""
     settings = Settings(_env_file=None)
     app = create_app(settings)
     app.dependency_overrides[get_current_auth] = lambda: _auth_context(UserRole.APPLICANT)
-    app.dependency_overrides[get_master_data_service] = lambda: object()
-    with TestClient(RequestIdMiddleware(app, settings), raise_server_exceptions=False) as client:
+    app.dependency_overrides[get_master_data_service] = lambda: MasterDataService(None)
+    with TestClient(RequestIdMiddleware(app, settings)) as client:
         response = client.post(
             "/api/v1/master-data/supplier/supplier_a/changes",
             json={"changes": [], "reason": "test"},
+            headers={"X-Request-ID": "master-data-invalid"},
         )
 
     assert response.status_code == 422
+    assert response.json()["error"]["code"] == "MASTER_DATA_INVALID_CHANGE"
+    assert response.json()["error"]["request_id"] == "master-data-invalid"
+
+
+def test_invalid_reason_uses_master_data_error_envelope() -> None:
+    """验证空白 reason 经主数据应用错误返回统一 Envelope 和 Request ID。"""
+    settings = Settings(_env_file=None)
+    app = create_app(settings)
+    app.dependency_overrides[get_current_auth] = lambda: _auth_context(UserRole.APPLICANT)
+    app.dependency_overrides[get_master_data_service] = lambda: MasterDataService(None)
+    with TestClient(RequestIdMiddleware(app, settings)) as client:
+        response = client.post(
+            "/api/v1/master-data/supplier/supplier_a/changes",
+            json={"changes": {"currency": "USD"}, "reason": "  "},
+            headers={"X-Request-ID": "master-data-invalid"},
+        )
+
+    assert response.status_code == 422
+    assert response.json()["error"]["code"] == "MASTER_DATA_INVALID_CHANGE"
+    assert response.json()["error"]["request_id"] == "master-data-invalid"
+
+
+def test_invalid_change_variants_use_master_data_error_envelope() -> None:
+    """验证非 JSON changes、空 patch 和超长 reason 都使用统一业务错误。"""
+    settings = Settings(_env_file=None)
+    invalid_payloads = (
+        '{"changes":{"value":NaN},"reason":"test"}',
+        '{"changes":{},"reason":"test"}',
+        '{"changes":{"value":"x"},"reason":"' + ("x" * 2001) + '"}',
+    )
+    for body in invalid_payloads:
+        app = create_app(settings)
+        app.dependency_overrides[get_current_auth] = lambda: _auth_context(UserRole.APPLICANT)
+        app.dependency_overrides[get_master_data_service] = lambda: MasterDataService(None)
+        with TestClient(RequestIdMiddleware(app, settings)) as client:
+            response = client.post(
+                "/api/v1/master-data/supplier/supplier_a/changes",
+                content=body,
+                headers={
+                    "Content-Type": "application/json",
+                    "X-Request-ID": "master-data-invalid",
+                },
+            )
+        assert response.status_code == 422
+        assert response.json()["error"]["code"] == "MASTER_DATA_INVALID_CHANGE"
+        assert response.json()["error"]["request_id"] == "master-data-invalid"
+
+
+def test_unauthenticated_get_returns_bearer_challenge() -> None:
+    """验证未认证主数据读取返回 AUTH_UNAUTHENTICATED 和 Bearer challenge。"""
+    settings = Settings(_env_file=None)
+    app = create_app(settings)
+    app.dependency_overrides[get_master_data_service] = lambda: object()
+    with TestClient(RequestIdMiddleware(app, settings)) as client:
+        response = client.get("/api/v1/master-data/supplier/supplier_a")
+
+    assert response.status_code == 401
+    assert response.json()["error"]["code"] == "AUTH_UNAUTHENTICATED"
+    assert response.headers["WWW-Authenticate"] == "Bearer"

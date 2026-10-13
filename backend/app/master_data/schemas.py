@@ -3,15 +3,13 @@
 from typing import Any
 from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict
 
 from app.domain.approval.enums import ApprovalStatus
 from app.domain.master_data.diff import (
     JsonValue,
     MasterDataDiffOperation,
-    validate_json_object,
 )
-from app.domain.master_data.errors import MasterDataDomainError
 
 
 class ChangeDraftRequest(BaseModel):
@@ -20,28 +18,9 @@ class ChangeDraftRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     draft_approval_id: UUID | None = None
-    changes: dict[str, JsonValue]
-    reason: str = Field(max_length=2000)
-
-    @field_validator("changes", mode="before")
-    @classmethod
-    def validate_changes(cls, value: object) -> dict[str, Any]:
-        """在 Pydantic 类型转换前验证 patch 是 JSON-compatible object。"""
-        try:
-            return validate_json_object(value, "changes")
-        except MasterDataDomainError as error:
-            raise ValueError(str(error)) from error
-
-    @field_validator("reason")
-    @classmethod
-    def normalize_reason(cls, value: str) -> str:
-        """去除 reason 首尾空格并拒绝空白说明。"""
-        normalized = value.strip()
-        if not normalized:
-            raise ValueError("reason 去除首尾空格后不能为空")
-        if len(normalized) > 2000:
-            raise ValueError("reason 长度不能超过 2000")
-        return normalized
+    # 将业务校验留给 Service，确保错误经过统一 AppError Envelope。
+    changes: Any
+    reason: Any
 
 
 class MasterDataEntityResponse(BaseModel):

@@ -418,3 +418,151 @@ def test_postgres_update_draft_rolls_back_after_flush(monkeypatch) -> None:
             await engine.dispose()
 
     asyncio.run(run())
+
+
+def test_postgres_create_for_missing_entity_writes_no_rows() -> None:
+    """验证不存在的当前实体无法创建草稿且三张审批表均无新增记录。"""
+
+    async def run() -> None:
+        """比较失败请求前后的持久化记录数量。"""
+        engine = create_db_engine(get_settings())
+        factory = create_session_factory(engine)
+        entity_key = f"missing-{uuid4().hex}"
+        try:
+            async with factory() as session:
+                before_counts = (
+                    await session.scalar(select(func.count()).select_from(ApprovalApplication)),
+                    await session.scalar(select(func.count()).select_from(MasterDataChange)),
+                    await session.scalar(select(func.count()).select_from(ApprovalRecord)),
+                )
+            async with factory() as session:
+                with pytest.raises(MasterDataError) as error:
+                    await MasterDataService(session).create_or_update_draft(
+                        "supplier",
+                        entity_key,
+                        ChangeDraftRequest(changes={"currency": "USD"}, reason="create"),
+                        _auth_context(),
+                    )
+                assert error.value.code == MasterDataErrorCode.NOT_FOUND.value
+            async with factory() as session:
+                after_counts = (
+                    await session.scalar(select(func.count()).select_from(ApprovalApplication)),
+                    await session.scalar(select(func.count()).select_from(MasterDataChange)),
+                    await session.scalar(select(func.count()).select_from(ApprovalRecord)),
+                )
+                assert after_counts == before_counts
+        finally:
+            await engine.dispose()
+
+    asyncio.run(run())
+
+
+def test_postgres_create_noop_writes_no_approval_rows() -> None:
+    """验证与当前快照相同的 create patch 被拒绝且不写入审批数据。"""
+
+    async def run() -> None:
+        """在随机实体上执行 no-op 并通过独立 Session 检查无残留。"""
+        engine = create_db_engine(get_settings())
+        factory = create_session_factory(engine)
+        entity_key = f"noop-{uuid4().hex}"
+        try:
+            async with factory() as session:
+                session.add(
+                    MasterDataEntity(
+                        entity_type="supplier",
+                        entity_key=entity_key,
+                        data_json={"currency": "CNY"},
+                        version=1,
+                    )
+                )
+                await session.commit()
+            async with factory() as session:
+                before_counts = (
+                    await session.scalar(select(func.count()).select_from(ApprovalApplication)),
+                    await session.scalar(select(func.count()).select_from(MasterDataChange)),
+                    await session.scalar(select(func.count()).select_from(ApprovalRecord)),
+                )
+            async with factory() as session:
+                with pytest.raises(MasterDataError) as error:
+                    await MasterDataService(session).create_or_update_draft(
+                        "supplier",
+                        entity_key,
+                        ChangeDraftRequest(changes={"currency": "CNY"}, reason="no-op"),
+                        _auth_context(),
+                    )
+                assert error.value.code == MasterDataErrorCode.NO_CHANGE.value
+            async with factory() as session:
+                after_counts = (
+                    await session.scalar(select(func.count()).select_from(ApprovalApplication)),
+                    await session.scalar(select(func.count()).select_from(MasterDataChange)),
+                    await session.scalar(select(func.count()).select_from(ApprovalRecord)),
+                )
+                assert after_counts == before_counts
+        finally:
+            async with factory() as session:
+                await session.execute(
+                    delete(MasterDataEntity).where(
+                        MasterDataEntity.entity_type == "supplier",
+                        MasterDataEntity.entity_key == entity_key,
+                    )
+                )
+                await session.commit()
+            await engine.dispose()
+
+    asyncio.run(run())
+
+
+def test_postgres_unknown_draft_id_does_not_create_save_record() -> None:
+    """验证不存在的草稿 ID 返回 NOT_FOUND 且不留下 SAVE 历史。"""
+
+    async def run() -> None:
+        """用随机不存在 ID 更新并在新 Session 检查三张表。"""
+        engine = create_db_engine(get_settings())
+        factory = create_session_factory(engine)
+        approval_id = uuid4()
+        try:
+            async with factory() as session:
+                with pytest.raises(MasterDataError) as error:
+                    await MasterDataService(session).create_or_update_draft(
+                        "supplier",
+                        f"unknown-{uuid4().hex}",
+                        ChangeDraftRequest(
+                            draft_approval_id=approval_id,
+                            changes={"currency": "USD"},
+                            reason="unknown draft",
+                        ),
+                        _auth_context(),
+                    )
+                assert error.value.code == MasterDataErrorCode.DRAFT_NOT_FOUND.value
+            async with factory() as session:
+                assert (
+                    await session.scalar(
+                        select(func.count())
+                        .select_from(ApprovalRecord)
+                        .where(
+                            ApprovalRecord.approval_id == approval_id,
+                            ApprovalRecord.action == ApprovalAction.SAVE,
+                        )
+                    )
+                    == 0
+                )
+                assert (
+                    await session.scalar(
+                        select(func.count())
+                        .select_from(ApprovalApplication)
+                        .where(ApprovalApplication.id == approval_id)
+                    )
+                    == 0
+                )
+                assert (
+                    await session.scalar(
+                        select(func.count())
+                        .select_from(MasterDataChange)
+                        .where(MasterDataChange.approval_id == approval_id)
+                    )
+                    == 0
+                )
+        finally:
+            await engine.dispose()
+
+    asyncio.run(run())
