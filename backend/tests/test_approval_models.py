@@ -45,6 +45,7 @@ def test_metadata_contains_approval_and_auth_tables() -> None:
         "users",
         "user_roles",
         "auth_sessions",
+        "workflow_definitions",
     }
 
 
