@@ -826,7 +826,15 @@ def test_postgres_approval_actions_runtime_history_permissions_and_rollback(monk
                         )
                     ).all()
                 )
-                assert all(change.form_data == {"name": "after"} for change in changes)
+                assert all(
+                    change.form_data
+                    == (
+                        {"name": "edited after"}
+                        if change.approval_id == reject_resubmit_id
+                        else {"name": "after"}
+                    )
+                    for change in changes
+                )
                 assert all(entity.data_json == {"name": "current"} for entity in entities)
                 assert all(entity.version == 3 for entity in entities)
         finally:
