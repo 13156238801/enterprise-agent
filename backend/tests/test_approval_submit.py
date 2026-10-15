@@ -655,13 +655,9 @@ def test_postgres_workflow_binding_constraints_reject_invalid_pairs() -> None:
                             "code": missing_code,
                         },
                     )
-                original_error = foreign_key_error.value.orig
-                actual_constraint = getattr(original_error, "constraint_name", None)
-                if actual_constraint is None:
-                    actual_constraint = getattr(
-                        getattr(original_error, "diag", None), "constraint_name", None
-                    )
-                assert actual_constraint == "fk_approval_application_workflow_definition"
+                assert "fk_approval_application_workflow_definition" in str(
+                    foreign_key_error.value.orig
+                )
                 await session.rollback()
 
                 constraint_names = set(
@@ -719,6 +715,15 @@ def test_postgres_submit_rejects_broken_business_and_workflow_links() -> None:
         """写入真实 PostgreSQL 关联数据并验证错误路径不产生提交历史。"""
         try:
             async with factory() as session:
+                session.add(
+                    WorkflowDefinition(
+                        code=corrupt_workflow_code,
+                        version=1,
+                        definition_json={"corrupt": True},
+                        active=False,
+                    )
+                )
+                await session.flush()
                 session.add_all(
                     [
                         ApprovalApplication(
@@ -780,12 +785,6 @@ def test_postgres_submit_rejects_broken_business_and_workflow_links() -> None:
                             base_entity_version=1,
                             form_data={"name": "after"},
                             change_items=[{"field": "name", "operation": "UPDATE"}],
-                        ),
-                        WorkflowDefinition(
-                            code=corrupt_workflow_code,
-                            version=1,
-                            definition_json={"corrupt": True},
-                            active=False,
                         ),
                     ]
                 )
