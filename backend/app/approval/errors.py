@@ -1,4 +1,4 @@
-"""定义 Submit API 使用的稳定审批错误。"""
+"""定义审批 API 使用的稳定业务错误。"""
 
 from enum import StrEnum
 
@@ -13,14 +13,18 @@ class ApprovalErrorCode(StrEnum):
     FORBIDDEN = "APPROVAL_FORBIDDEN"
     WORKFLOW_NOT_CONFIGURED = "APPROVAL_WORKFLOW_NOT_CONFIGURED"
     DATA_INTEGRITY_ERROR = "APPROVAL_DATA_INTEGRITY_ERROR"
+    INVALID_REQUEST = "APPROVAL_INVALID_REQUEST"
+    REJECT_TARGET_UNAVAILABLE = "APPROVAL_REJECT_TARGET_UNAVAILABLE"
 
 
 _MESSAGES = {
     ApprovalErrorCode.NOT_FOUND: "审批申请不存在",
-    ApprovalErrorCode.INVALID_TRANSITION: "当前审批状态不允许提交",
-    ApprovalErrorCode.FORBIDDEN: "只有原申请人可以提交此审批",
+    ApprovalErrorCode.INVALID_TRANSITION: "当前审批状态不允许此操作",
+    ApprovalErrorCode.FORBIDDEN: "无权处理当前审批任务",
     ApprovalErrorCode.WORKFLOW_NOT_CONFIGURED: "当前业务尚未配置可用审批流程",
     ApprovalErrorCode.DATA_INTEGRITY_ERROR: "审批申请或绑定流程数据不完整",
+    ApprovalErrorCode.INVALID_REQUEST: "审批操作请求无效",
+    ApprovalErrorCode.REJECT_TARGET_UNAVAILABLE: "当前节点没有可退回的上一审批节点",
 }
 
 
@@ -30,3 +34,4 @@ class ApprovalError(AppError):
     def __init__(self, code: ApprovalErrorCode) -> None:
         """按错误码设置固定公开消息。"""
         super().__init__(code.value, _MESSAGES[code])
+

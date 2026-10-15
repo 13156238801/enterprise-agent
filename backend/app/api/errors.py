@@ -28,6 +28,8 @@ _APPROVAL_HTTP_STATUS = {
     ApprovalErrorCode.FORBIDDEN.value: 403,
     ApprovalErrorCode.WORKFLOW_NOT_CONFIGURED.value: 409,
     ApprovalErrorCode.DATA_INTEGRITY_ERROR.value: 500,
+    ApprovalErrorCode.INVALID_REQUEST.value: 422,
+    ApprovalErrorCode.REJECT_TARGET_UNAVAILABLE.value: 409,
 }
 
 
@@ -58,3 +60,4 @@ async def app_error_handler(request: Request, error: AppError) -> JSONResponse:
 def register_error_handlers(api: FastAPI) -> None:
     """为 FastAPI 应用注册统一应用错误处理器。"""
     api.add_exception_handler(AppError, app_error_handler)
+
