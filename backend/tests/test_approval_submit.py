@@ -353,6 +353,7 @@ def test_postgres_submit_binding_resubmit_and_rollback(monkeypatch) -> None:
                 approval = await session.get(ApprovalApplication, approval_id)
                 assert approval is not None
                 first_runtime = (approval.workflow_instance_id, approval.current_task_id)
+            async with factory() as session:
                 with pytest.raises(ApprovalError) as duplicate_error:
                     await ApprovalService(session).submit(approval_id, auth)
                 assert duplicate_error.value.code == ApprovalErrorCode.INVALID_TRANSITION.value
