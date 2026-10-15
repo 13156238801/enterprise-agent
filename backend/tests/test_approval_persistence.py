@@ -45,7 +45,9 @@ def test_postgres_persists_approval_models_and_relationships() -> None:
                     change = MasterDataChange(
                         approval=application,
                         entity_type="demo_asset",
-                        entity_id="external-asset-001",
+                        entity_key="external-asset-001",
+                        before_data={"name": "Old Demo Name"},
+                        base_entity_version=1,
                         form_data={"name": "Demo Asset"},
                         change_items=[
                             {
@@ -87,7 +89,9 @@ def test_postgres_persists_approval_models_and_relationships() -> None:
                     duplicate_change = MasterDataChange(
                         approval_id=approval_id,
                         entity_type="demo_asset_duplicate",
-                        entity_id="external-asset-duplicate",
+                        entity_key="external-asset-duplicate",
+                        before_data={},
+                        base_entity_version=1,
                         form_data={},
                         change_items=[],
                     )

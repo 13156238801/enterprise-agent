@@ -8,6 +8,7 @@ from app.auth.context import AuthContext
 from app.auth.errors import AuthError, AuthErrorCode
 from app.auth.service import AuthService
 from app.domain.auth.enums import UserRole
+from app.master_data.service import MasterDataService
 
 _bearer_scheme = HTTPBearer(auto_error=False)
 
@@ -24,6 +25,13 @@ async def get_auth_service(
 ) -> AuthService:
     """使用请求 Session 和应用设置构造认证服务。"""
     return AuthService(session, request.app.state.settings)
+
+
+async def get_master_data_service(
+    session: AsyncSession = Depends(get_db_session),
+) -> MasterDataService:
+    """用当前请求独享的 Session 构造主数据应用服务。"""
+    return MasterDataService(session)
 
 
 async def get_current_auth(
