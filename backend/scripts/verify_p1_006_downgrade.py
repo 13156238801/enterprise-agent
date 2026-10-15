@@ -23,7 +23,7 @@ async def _verify() -> None:
                 "master_data_entities",
                 "workflow_definitions",
                 "users",
-                "user_role_assignments",
+                "user_roles",
                 "auth_sessions",
             }
             missing_tables = expected_tables - table_names
