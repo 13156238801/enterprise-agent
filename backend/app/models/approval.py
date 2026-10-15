@@ -4,7 +4,19 @@ from datetime import datetime
 from typing import TYPE_CHECKING
 from uuid import UUID, uuid4
 
-from sqlalchemy import DateTime, Enum, ForeignKey, Index, Integer, String, Text, func, text
+from sqlalchemy import (
+    CheckConstraint,
+    DateTime,
+    Enum,
+    ForeignKey,
+    ForeignKeyConstraint,
+    Index,
+    Integer,
+    String,
+    Text,
+    func,
+    text,
+)
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.domain.approval.enums import ApprovalAction, ApprovalStatus, BusinessType
@@ -19,6 +31,20 @@ class ApprovalApplication(Base):
 
     __tablename__ = "approval_application"
     __table_args__ = (
+        CheckConstraint(
+            "(workflow_code IS NULL AND workflow_version IS NULL) "
+            "OR (workflow_code IS NOT NULL AND workflow_version IS NOT NULL)",
+            name="ck_approval_application_workflow_binding_pair",
+        ),
+        CheckConstraint(
+            "workflow_version IS NULL OR workflow_version > 0",
+            name="ck_approval_application_workflow_version_positive",
+        ),
+        ForeignKeyConstraint(
+            ["workflow_code", "workflow_version"],
+            ["workflow_definitions.code", "workflow_definitions.version"],
+            name="fk_approval_application_workflow_definition",
+        ),
         Index("ix_approval_application_status", "status"),
         Index("ix_approval_application_applicant_id", "applicant_id"),
         Index("ix_approval_application_business_type", "business_type"),
@@ -49,6 +75,8 @@ class ApprovalApplication(Base):
         server_default=text("'DRAFT'"),
         nullable=False,
     )
+    workflow_code: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    workflow_version: Mapped[int | None] = mapped_column(Integer, nullable=True)
     workflow_instance_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
     current_task_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
     current_node_code: Mapped[str | None] = mapped_column(String(128), nullable=True)

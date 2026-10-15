@@ -8,6 +8,7 @@ from fastapi.responses import JSONResponse
 from sqlalchemy import text
 
 from app.api.errors import register_error_handlers
+from app.api.v1.approvals import router as approvals_router
 from app.api.v1.auth import router as auth_router
 from app.api.v1.master_data import router as master_data_router
 from app.core.config import get_settings
@@ -58,6 +59,7 @@ def create_app(app_settings=settings) -> FastAPI:
     api = FastAPI(title="Enterprise Agent API", version="0.1.0", lifespan=lifespan)
     api.state.settings = app_settings
     api.include_router(auth_router)
+    api.include_router(approvals_router)
     api.include_router(master_data_router)
     register_error_handlers(api)
 

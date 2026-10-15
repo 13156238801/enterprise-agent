@@ -4,6 +4,7 @@ from fastapi import Depends, Request
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.approval.service import ApprovalService
 from app.auth.context import AuthContext
 from app.auth.errors import AuthError, AuthErrorCode
 from app.auth.service import AuthService
@@ -32,6 +33,13 @@ async def get_master_data_service(
 ) -> MasterDataService:
     """用当前请求独享的 Session 构造主数据应用服务。"""
     return MasterDataService(session)
+
+
+async def get_approval_service(
+    session: AsyncSession = Depends(get_db_session),
+) -> ApprovalService:
+    """用当前请求独享的 Session 构造审批应用服务。"""
+    return ApprovalService(session)
 
 
 async def get_current_auth(

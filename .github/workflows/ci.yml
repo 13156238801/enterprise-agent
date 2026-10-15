@@ -34,6 +34,11 @@ jobs:
       - run: uv run ruff format --check .
       - run: uv run alembic upgrade head
       - run: uv run alembic check
+      - run: uv run alembic downgrade c5a005d1f005
+      - name: Verify P1-006 downgrade preserves P1-005 tables
+        run: uv run python -m scripts.verify_p1_006_downgrade
+      - run: uv run alembic upgrade head
+      - run: uv run alembic check
       - run: uv run alembic downgrade d1f004a203bc
       - name: Verify P1-005 downgrade and prepare legacy backfill row
         run: uv run python -m scripts.prepare_p1_005_backfill
