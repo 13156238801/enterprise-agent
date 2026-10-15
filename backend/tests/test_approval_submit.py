@@ -42,37 +42,61 @@ def test_submit_api_requires_bearer_and_returns_request_id_error_envelope() -> N
 
 
 @pytest.mark.parametrize(
-    ("roles", "expected_status", "expected_code", "service_error_code"),
+    ("roles", "expected_status", "expected_code", "service_error_code", "service_called"),
     [
         (
             {UserRole.APPROVER},
             403,
             "AUTH_PERMISSION_DENIED",
             ApprovalErrorCode.INVALID_TRANSITION,
+            False,
+        ),
+        (
+            {UserRole.DATA_ADMIN},
+            403,
+            "AUTH_PERMISSION_DENIED",
+            ApprovalErrorCode.INVALID_TRANSITION,
+            False,
+        ),
+        (
+            {UserRole.ADMIN},
+            403,
+            "AUTH_PERMISSION_DENIED",
+            ApprovalErrorCode.INVALID_TRANSITION,
+            False,
         ),
         (
             {UserRole.APPLICANT},
             409,
             "APPROVAL_INVALID_TRANSITION",
             ApprovalErrorCode.INVALID_TRANSITION,
+            True,
         ),
-        ({UserRole.APPLICANT}, 403, "APPROVAL_FORBIDDEN", ApprovalErrorCode.FORBIDDEN),
+        (
+            {UserRole.APPLICANT},
+            403,
+            "APPROVAL_FORBIDDEN",
+            ApprovalErrorCode.FORBIDDEN,
+            True,
+        ),
         (
             {UserRole.APPLICANT},
             404,
             "APPROVAL_NOT_FOUND",
             ApprovalErrorCode.NOT_FOUND,
+            True,
         ),
         (
             {UserRole.APPLICANT},
             409,
             "APPROVAL_WORKFLOW_NOT_CONFIGURED",
             ApprovalErrorCode.WORKFLOW_NOT_CONFIGURED,
+            True,
         ),
     ],
 )
 def test_submit_api_role_guard_and_error_mapping(
-    roles, expected_status, expected_code, service_error_code
+    roles, expected_status, expected_code, service_error_code, service_called
 ) -> None:
     """验证 APPLICANT 显式角色门禁及审批错误的统一 HTTP 映射。"""
     from app.auth.context import AuthContext
@@ -96,15 +120,21 @@ def test_submit_api_role_guard_and_error_mapping(
     class FakeApprovalService:
         """在 HTTP 边界触发目标审批错误。"""
 
+        def __init__(self) -> None:
+            """初始化服务调用计数，供权限绕过断言使用。"""
+            self.calls = 0
+
         async def submit(self, approval_id, current_auth):
             """验证服务只收到可信身份，再返回稳定审批错误。"""
+            self.calls += 1
             assert current_auth is auth_context
             raise ApprovalError(service_error_code)
 
     settings = Settings(_env_file=None)
     api = create_app(settings)
+    service_stub = FakeApprovalService()
     api.dependency_overrides[get_auth_service] = lambda: FakeAuthService()
-    api.dependency_overrides[get_approval_service] = lambda: FakeApprovalService()
+    api.dependency_overrides[get_approval_service] = lambda: service_stub
     client = TestClient(RequestIdMiddleware(api, settings))
     response = client.post(
         f"/api/v1/approvals/{uuid4()}/submit",
@@ -114,6 +144,7 @@ def test_submit_api_role_guard_and_error_mapping(
     assert response.status_code == expected_status
     assert response.json()["error"]["code"] == expected_code
     assert response.json()["error"]["request_id"] == "submit-role"
+    assert service_stub.calls == int(service_called)
 
 
 def test_submit_api_owner_success_ignores_client_workflow_values() -> None:
@@ -608,6 +639,31 @@ def test_postgres_workflow_binding_constraints_reject_invalid_pairs() -> None:
                     )
                 await session.rollback()
 
+                missing_code = f"missing_{uuid4().hex}"
+                with pytest.raises(IntegrityError) as foreign_key_error:
+                    await session.execute(
+                        text(
+                            "INSERT INTO approval_application "
+                            "(id, business_type, business_id, applicant_id, status, version, "
+                            "workflow_code, workflow_version) VALUES "
+                            "(:id, 'MASTER_DATA_CHANGE', :business_id, 'test', 'DRAFT', 1, "
+                            ":code, 1)"
+                        ),
+                        {
+                            "id": uuid4(),
+                            "business_id": str(uuid4()),
+                            "code": missing_code,
+                        },
+                    )
+                original_error = foreign_key_error.value.orig
+                actual_constraint = getattr(original_error, "constraint_name", None)
+                if actual_constraint is None:
+                    actual_constraint = getattr(
+                        getattr(original_error, "diag", None), "constraint_name", None
+                    )
+                assert actual_constraint == "fk_approval_application_workflow_definition"
+                await session.rollback()
+
                 constraint_names = set(
                     (
                         await session.scalars(
@@ -622,6 +678,179 @@ def test_postgres_workflow_binding_constraints_reject_invalid_pairs() -> None:
                 assert "ck_approval_application_workflow_version_positive" in constraint_names
                 assert "fk_approval_application_workflow_definition" in constraint_names
         finally:
+            await engine.dispose()
+
+    asyncio.run(run())
+
+
+def test_postgres_submit_rejects_broken_business_and_workflow_links() -> None:
+    """验证提交拒绝缺失或不一致的业务关联及损坏的已绑定流程快照。"""
+    from app.approval.service import ApprovalService
+    from app.auth.context import AuthContext
+
+    settings = Settings(_env_file=None)
+    engine = create_db_engine(settings)
+    factory = create_session_factory(engine)
+    applicant_id = uuid4()
+    missing_change_approval_id = uuid4()
+    mismatch_approval_id = uuid4()
+    mismatch_change_id = uuid4()
+    unsupported_approval_id = uuid4()
+    unsupported_change_id = uuid4()
+    corrupt_approval_id = uuid4()
+    corrupt_change_id = uuid4()
+    corrupt_workflow_code = f"corrupt_{uuid4().hex}"
+    approval_ids = (
+        missing_change_approval_id,
+        mismatch_approval_id,
+        unsupported_approval_id,
+        corrupt_approval_id,
+    )
+    change_ids = (mismatch_change_id, unsupported_change_id, corrupt_change_id)
+    auth = AuthContext(
+        session_id=uuid4(),
+        user_id=applicant_id,
+        username="applicant",
+        display_name="Applicant",
+        roles=frozenset({UserRole.APPLICANT}),
+    )
+
+    async def run() -> None:
+        """写入真实 PostgreSQL 关联数据并验证错误路径不产生提交历史。"""
+        try:
+            async with factory() as session:
+                session.add_all(
+                    [
+                        ApprovalApplication(
+                            id=missing_change_approval_id,
+                            business_type=BusinessType.MASTER_DATA_CHANGE,
+                            business_id=str(uuid4()),
+                            applicant_id=str(applicant_id),
+                            status=ApprovalStatus.DRAFT,
+                        ),
+                        ApprovalApplication(
+                            id=mismatch_approval_id,
+                            business_type=BusinessType.MASTER_DATA_CHANGE,
+                            business_id=str(uuid4()),
+                            applicant_id=str(applicant_id),
+                            status=ApprovalStatus.DRAFT,
+                        ),
+                        MasterDataChange(
+                            id=mismatch_change_id,
+                            approval_id=mismatch_approval_id,
+                            entity_type="supplier",
+                            entity_key=f"mismatch-{uuid4().hex}",
+                            before_data={"name": "before"},
+                            base_entity_version=1,
+                            form_data={"name": "after"},
+                            change_items=[{"field": "name", "operation": "UPDATE"}],
+                        ),
+                        ApprovalApplication(
+                            id=unsupported_approval_id,
+                            business_type=BusinessType.MASTER_DATA_CHANGE,
+                            business_id=str(unsupported_change_id),
+                            applicant_id=str(applicant_id),
+                            status=ApprovalStatus.DRAFT,
+                        ),
+                        MasterDataChange(
+                            id=unsupported_change_id,
+                            approval_id=unsupported_approval_id,
+                            entity_type="customer",
+                            entity_key=f"customer-{uuid4().hex}",
+                            before_data={"name": "before"},
+                            base_entity_version=1,
+                            form_data={"name": "after"},
+                            change_items=[{"field": "name", "operation": "UPDATE"}],
+                        ),
+                        ApprovalApplication(
+                            id=corrupt_approval_id,
+                            business_type=BusinessType.MASTER_DATA_CHANGE,
+                            business_id=str(corrupt_change_id),
+                            applicant_id=str(applicant_id),
+                            status=ApprovalStatus.DRAFT,
+                            workflow_code=corrupt_workflow_code,
+                            workflow_version=1,
+                        ),
+                        MasterDataChange(
+                            id=corrupt_change_id,
+                            approval_id=corrupt_approval_id,
+                            entity_type="supplier",
+                            entity_key=f"corrupt-{uuid4().hex}",
+                            before_data={"name": "before"},
+                            base_entity_version=1,
+                            form_data={"name": "after"},
+                            change_items=[{"field": "name", "operation": "UPDATE"}],
+                        ),
+                        WorkflowDefinition(
+                            code=corrupt_workflow_code,
+                            version=1,
+                            definition_json={"corrupt": True},
+                            active=False,
+                        ),
+                    ]
+                )
+                await session.commit()
+
+            cases = (
+                (missing_change_approval_id, ApprovalErrorCode.DATA_INTEGRITY_ERROR),
+                (mismatch_approval_id, ApprovalErrorCode.DATA_INTEGRITY_ERROR),
+                (unsupported_approval_id, ApprovalErrorCode.WORKFLOW_NOT_CONFIGURED),
+                (corrupt_approval_id, ApprovalErrorCode.DATA_INTEGRITY_ERROR),
+            )
+            for approval_id, expected_code in cases:
+                async with factory() as session:
+                    with pytest.raises(ApprovalError) as error:
+                        await ApprovalService(session).submit(approval_id, auth)
+                    assert error.value.code == expected_code.value
+
+            async with factory() as session:
+                records = list(
+                    (
+                        await session.scalars(
+                            select(ApprovalRecord).where(
+                                ApprovalRecord.approval_id.in_(approval_ids),
+                                ApprovalRecord.action == ApprovalAction.SUBMIT,
+                            )
+                        )
+                    ).all()
+                )
+                assert records == []
+                mismatch = await session.get(ApprovalApplication, mismatch_approval_id)
+                assert mismatch is not None
+                assert mismatch.status is ApprovalStatus.DRAFT
+                assert mismatch.workflow_code is None
+                assert mismatch.workflow_version is None
+                assert mismatch.workflow_instance_id is None
+                assert mismatch.current_task_id is None
+                assert mismatch.current_node_code is None
+                assert mismatch.submitted_at is None
+
+                corrupt = await session.get(ApprovalApplication, corrupt_approval_id)
+                assert corrupt is not None
+                assert corrupt.status is ApprovalStatus.DRAFT
+                assert corrupt.workflow_code == corrupt_workflow_code
+                assert corrupt.workflow_version == 1
+                assert corrupt.workflow_instance_id is None
+                assert corrupt.current_task_id is None
+                assert corrupt.current_node_code is None
+                assert corrupt.submitted_at is None
+        finally:
+            async with factory() as session:
+                await session.execute(
+                    delete(ApprovalRecord).where(ApprovalRecord.approval_id.in_(approval_ids))
+                )
+                await session.execute(
+                    delete(MasterDataChange).where(MasterDataChange.id.in_(change_ids))
+                )
+                await session.execute(
+                    delete(ApprovalApplication).where(ApprovalApplication.id.in_(approval_ids))
+                )
+                await session.execute(
+                    delete(WorkflowDefinition).where(
+                        WorkflowDefinition.code == corrupt_workflow_code
+                    )
+                )
+                await session.commit()
             await engine.dispose()
 
     asyncio.run(run())
