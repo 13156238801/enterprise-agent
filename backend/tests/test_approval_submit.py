@@ -237,6 +237,25 @@ def test_postgres_submit_binding_resubmit_and_rollback(monkeypatch) -> None:
                 roles=frozenset({UserRole.APPLICANT}),
             )
 
+            async with factory() as session:
+                with pytest.raises(ApprovalError) as workflow_error:
+                    await ApprovalService(session).submit(approval_id, auth)
+                assert workflow_error.value.code == ApprovalErrorCode.WORKFLOW_NOT_CONFIGURED.value
+            async with factory() as session:
+                session.add(
+                    WorkflowDefinition(
+                        code=spec.code,
+                        version=spec.version,
+                        definition_json={
+                            "code": spec.code,
+                            "version": spec.version,
+                            "nodes": [{"key": "manager_review", "role": "APPROVER"}],
+                        },
+                        active=True,
+                    )
+                )
+                await session.commit()
+
             original_save = ApprovalRepository.save_transition
 
             async def save_then_fail(repository, record) -> None:
@@ -268,24 +287,6 @@ def test_postgres_submit_binding_resubmit_and_rollback(monkeypatch) -> None:
                 )
             monkeypatch.setattr(ApprovalRepository, "save_transition", original_save)
 
-            async with factory() as session:
-                with pytest.raises(ApprovalError) as workflow_error:
-                    await ApprovalService(session).submit(approval_id, auth)
-                assert workflow_error.value.code == ApprovalErrorCode.WORKFLOW_NOT_CONFIGURED.value
-            async with factory() as session:
-                session.add(
-                    WorkflowDefinition(
-                        code=spec.code,
-                        version=spec.version,
-                        definition_json={
-                            "code": spec.code,
-                            "version": spec.version,
-                            "nodes": [{"key": "manager_review", "role": "APPROVER"}],
-                        },
-                        active=True,
-                    )
-                )
-                await session.commit()
             other_applicant = AuthContext(
                 session_id=uuid4(),
                 user_id=uuid4(),
