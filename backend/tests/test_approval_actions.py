@@ -2,6 +2,7 @@
 
 import asyncio
 from datetime import UTC, datetime
+from types import SimpleNamespace
 from uuid import UUID, uuid4
 
 import pytest
@@ -23,6 +24,8 @@ from app.domain.auth.enums import UserRole
 from app.domain.workflow.definition import WorkflowDefinitionSpec, WorkflowNodeDefinition
 from app.infrastructure.database import create_db_engine, create_session_factory
 from app.main import create_app
+from app.master_data.schemas import ChangeDraftRequest
+from app.master_data.service import MasterDataService
 from app.models.approval import ApprovalApplication, ApprovalRecord
 from app.models.master_data import MasterDataChange, MasterDataEntity
 from app.models.workflow import WorkflowDefinition
@@ -218,6 +221,75 @@ def test_approve_and_reject_invalid_comments_use_approval_error_envelope() -> No
         assert response.json()["error"]["request_id"] == "invalid-action"
 
 
+def test_missing_runtime_defers_status_legality_to_state_machine() -> None:
+    """验证缺少运行时字段时仍由状态机优先判定动作，并保留审批中完整性错误。"""
+
+    async def run() -> None:
+        """使用轻量申请对象验证状态机预判不依赖数据库。"""
+        for status in (ApprovalStatus.DRAFT, ApprovalStatus.COMPLETED):
+            for action in (ApprovalAction.APPROVE, ApprovalAction.REJECT):
+                approval_id = uuid4()
+                change_id = uuid4()
+                application = SimpleNamespace(
+                    id=approval_id,
+                    business_type=BusinessType.MASTER_DATA_CHANGE,
+                    business_id=str(change_id),
+                    master_data_change=SimpleNamespace(id=change_id),
+                    applicant_id=str(uuid4()),
+                    status=status,
+                    workflow_code=None,
+                    workflow_version=None,
+                    workflow_instance_id=None,
+                    current_task_id=None,
+                    current_node_code=None,
+                )
+                service = ApprovalService(object())
+
+                async def get_application_for_action(received_id: UUID):
+                    """返回指定的轻量申请，避免测试连接数据库。"""
+                    assert received_id == approval_id
+                    return application
+
+                service._repository.get_application_for_action = get_application_for_action
+                auth = _auth(frozenset({UserRole.APPROVER}))
+                with pytest.raises(ApprovalError) as error:
+                    await service._load_action_context(approval_id, action, auth)
+                assert error.value.code == ApprovalErrorCode.INVALID_TRANSITION.value
+
+        approval_id = uuid4()
+        change_id = uuid4()
+        application = SimpleNamespace(
+            id=approval_id,
+            business_type=BusinessType.MASTER_DATA_CHANGE,
+            business_id=str(change_id),
+            master_data_change=SimpleNamespace(id=change_id),
+            applicant_id=str(uuid4()),
+            status=ApprovalStatus.IN_APPROVAL,
+            workflow_code=None,
+            workflow_version=None,
+            workflow_instance_id=None,
+            current_task_id=None,
+            current_node_code=None,
+        )
+        service = ApprovalService(object())
+
+        async def get_corrupt_application(received_id: UUID):
+            """返回缺少流程运行时字段的审批中申请。"""
+            assert received_id == approval_id
+            return application
+
+        service._repository.get_application_for_action = get_corrupt_application
+        with pytest.raises(ApprovalError) as error:
+            await service._load_action_context(
+                approval_id,
+                ApprovalAction.APPROVE,
+                _auth(frozenset({UserRole.APPROVER})),
+            )
+        assert error.value.code == ApprovalErrorCode.DATA_INTEGRITY_ERROR.value
+
+    asyncio.run(run())
+
+
 def test_reject_structural_extra_fields_keep_fastapi_validation_behavior() -> None:
     """验证客户端注入目标节点字段仍由 extra-forbid 结构校验拒绝。"""
     client = _client_for(_auth(frozenset({UserRole.APPROVER})), object())
@@ -368,6 +440,12 @@ def test_postgres_approval_actions_runtime_history_permissions_and_rollback(monk
                 )
                 final_id, _, _, _ = await add_case(session, node="data_admin_review")
                 reject_applicant_id, _, _, _ = await add_case(session, node="manager_review")
+                (
+                    reject_resubmit_id,
+                    reject_resubmit_change_id,
+                    reject_resubmit_task,
+                    _,
+                ) = await add_case(session, node="manager_review")
                 reject_previous_id, _, old_return_task, _ = await add_case(
                     session,
                     node="data_admin_review",
@@ -391,11 +469,6 @@ def test_postgres_approval_actions_runtime_history_permissions_and_rollback(monk
                 no_previous_history_id, _, _, _ = await add_case(
                     session,
                     node="data_admin_review",
-                )
-                invalid_status_id, _, _, _ = await add_case(
-                    session,
-                    node="manager_review",
-                    status=ApprovalStatus.DRAFT,
                 )
                 missing_change_id, missing_change_pk, _, _ = await add_case(
                     session, node="manager_review"
@@ -467,11 +540,47 @@ def test_postgres_approval_actions_runtime_history_permissions_and_rollback(monk
                     assert record.target_operator_id is None
 
             async with factory() as session:
+                final_before = await session.get(ApprovalApplication, final_id)
+                assert final_before is not None
+                final_workflow_instance = final_before.workflow_instance_id
+                final_submitted_at = final_before.submitted_at
+                final_version = final_before.version
+                final_task_id = final_before.current_task_id
+                final_node_code = final_before.current_node_code
+            async with factory() as session:
                 result = await ApprovalService(session).approve(final_id, data_admin_auth)
                 assert result.status is ApprovalStatus.COMPLETED
                 assert result.current_task_id is None and result.current_node_code is None
                 assert result.current_node_role is None
                 assert result.completed_at is not None and result.completed_at.tzinfo is not None
+            async with factory() as verify:
+                completed = await verify.get(ApprovalApplication, final_id)
+                assert completed is not None
+                assert completed.status is ApprovalStatus.COMPLETED
+                assert completed.workflow_code == workflow_code
+                assert completed.workflow_version == 1
+                assert completed.workflow_instance_id == final_workflow_instance
+                assert completed.submitted_at == final_submitted_at
+                assert completed.version == final_version
+                assert completed.current_task_id is None
+                assert completed.current_node_code is None
+                assert completed.current_node_name is None
+                assert (
+                    completed.completed_at is not None and completed.completed_at.tzinfo is not None
+                )
+                final_record = await verify.scalar(
+                    select(ApprovalRecord).where(
+                        ApprovalRecord.approval_id == final_id,
+                        ApprovalRecord.action == ApprovalAction.APPROVE,
+                    )
+                )
+                assert final_record is not None
+                assert final_record.from_task_id == final_task_id
+                assert final_record.from_node_code == final_node_code
+                assert final_record.target_task_id is None
+                assert final_record.target_node_code is None
+                assert final_record.target_node_name is None
+                assert final_record.target_operator_id is None
             async with factory() as session:
                 result = await ApprovalService(session).reject(
                     reject_applicant_id, manager_auth, RejectTargetType.APPLICANT, "  请修改  "
@@ -489,6 +598,89 @@ def test_postgres_approval_actions_runtime_history_permissions_and_rollback(monk
                 assert record is not None and record.target_operator_id == application.applicant_id
                 assert record.target_task_id is None and record.target_node_code is None
                 assert record.comment == "请修改"
+
+            # 真实驳回产生无运行时字段的 DRAFT；P1-002 必须先判定状态非法。
+            async with factory() as session:
+                result = await ApprovalService(session).reject(
+                    reject_resubmit_id, manager_auth, RejectTargetType.APPLICANT, "请修改后重提"
+                )
+                assert result.status is ApprovalStatus.DRAFT
+                assert result.current_task_id is None and result.current_node_code is None
+            for action in ("approve", "reject"):
+                async with factory() as session:
+                    with pytest.raises(ApprovalError) as error:
+                        service = ApprovalService(session)
+                        if action == "approve":
+                            await service.approve(reject_resubmit_id, data_admin_auth)
+                        else:
+                            await service.reject(
+                                reject_resubmit_id,
+                                data_admin_auth,
+                                RejectTargetType.APPLICANT,
+                                "非法再次驳回",
+                            )
+                    assert error.value.code == ApprovalErrorCode.INVALID_TRANSITION.value
+
+            async with factory() as session:
+                draft = await session.get(ApprovalApplication, reject_resubmit_id)
+                change = await session.get(MasterDataChange, reject_resubmit_change_id)
+                assert draft is not None and change is not None
+                original_instance_id = draft.workflow_instance_id
+                original_submitted_at = draft.submitted_at
+                original_applicant_id = UUID(draft.applicant_id)
+                original_entity_key = change.entity_key
+                original_workflow = (draft.workflow_code, draft.workflow_version)
+            async with factory() as session:
+                updated = await MasterDataService(session).create_or_update_draft(
+                    "supplier",
+                    original_entity_key,
+                    ChangeDraftRequest(
+                        draft_approval_id=reject_resubmit_id,
+                        changes={"name": "edited after"},
+                        reason="更新后重新提交",
+                    ),
+                    _auth(frozenset({UserRole.APPLICANT}), original_applicant_id),
+                )
+                assert updated.approval_id == reject_resubmit_id
+            async with factory() as session:
+                resubmitted = await ApprovalService(session).submit(
+                    reject_resubmit_id,
+                    _auth(frozenset({UserRole.APPLICANT}), original_applicant_id),
+                )
+                assert resubmitted.status is ApprovalStatus.IN_APPROVAL
+                assert resubmitted.current_node_code == "manager_review"
+                assert resubmitted.current_task_id != reject_resubmit_task
+                assert resubmitted.workflow_code == workflow_code
+                assert resubmitted.workflow_version == 1
+                assert resubmitted.workflow_instance_id != original_instance_id
+                assert resubmitted.submitted_at > original_submitted_at
+                assert original_workflow == (workflow_code, 1)
+            async with factory() as verify:
+                resubmitted_application = await verify.get(ApprovalApplication, reject_resubmit_id)
+                assert resubmitted_application is not None
+                assert (
+                    resubmitted_application.workflow_code,
+                    resubmitted_application.workflow_version,
+                ) == original_workflow
+                assert resubmitted_application.workflow_instance_id != original_instance_id
+                assert resubmitted_application.current_task_id == resubmitted.current_task_id
+                assert resubmitted_application.current_node_code == "manager_review"
+                assert resubmitted_application.submitted_at == resubmitted.submitted_at
+
+            for action in ("approve", "reject"):
+                async with factory() as session:
+                    with pytest.raises(ApprovalError) as error:
+                        service = ApprovalService(session)
+                        if action == "approve":
+                            await service.approve(final_id, data_admin_auth)
+                        else:
+                            await service.reject(
+                                final_id,
+                                data_admin_auth,
+                                RejectTargetType.APPLICANT,
+                                "已完成申请不可驳回",
+                            )
+                    assert error.value.code == ApprovalErrorCode.INVALID_TRANSITION.value
 
             async with factory() as session:
                 result = await ApprovalService(session).reject(
@@ -533,10 +725,6 @@ def test_postgres_approval_actions_runtime_history_permissions_and_rollback(monk
                 with pytest.raises(ApprovalError) as error:
                     await ApprovalService(session).approve(no_history_id, manager_auth)
                 assert error.value.code == ApprovalErrorCode.DATA_INTEGRITY_ERROR.value
-            async with factory() as session:
-                with pytest.raises(ApprovalError) as error:
-                    await ApprovalService(session).approve(invalid_status_id, manager_auth)
-                assert error.value.code == ApprovalErrorCode.INVALID_TRANSITION.value
             async with factory() as session:
                 with pytest.raises(ApprovalError) as error:
                     await ApprovalService(session).reject(

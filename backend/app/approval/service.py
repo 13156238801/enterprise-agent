@@ -139,7 +139,9 @@ class ApprovalService:
         """在单一事务中执行 APPROVE 状态迁移并追加不可变审批历史。"""
         normalized_comment = _normalize_approve_comment(comment)
         async with self._session.begin():
-            approval, spec, current_node, assignment = await self._load_action_context(approval_id)
+            approval, spec, current_node, assignment = await self._load_action_context(
+                approval_id, ApprovalAction.APPROVE, auth_context
+            )
             actor_id = str(auth_context.user_id)
             eligible = current_node.role in auth_context.roles and (
                 assignment.target_operator_id is None or assignment.target_operator_id == actor_id
@@ -203,7 +205,9 @@ class ApprovalService:
         """解析可信驳回目标后执行 REJECT 决策并原子更新运行时与历史。"""
         reject_target, normalized_comment = _normalize_reject_request(target, comment)
         async with self._session.begin():
-            approval, spec, current_node, assignment = await self._load_action_context(approval_id)
+            approval, spec, current_node, assignment = await self._load_action_context(
+                approval_id, ApprovalAction.REJECT, auth_context
+            )
             target_node = None
             target_operator_id = None
             if reject_target is RejectTargetType.APPLICANT:
@@ -285,8 +289,13 @@ class ApprovalService:
             )
             return _action_response(approval, decision.action, target_node)
 
-    async def _load_action_context(self, approval_id: UUID):
-        """验证审批业务关联与精确绑定流程，并解析当前节点任务创建历史。"""
+    async def _load_action_context(
+        self,
+        approval_id: UUID,
+        action: ApprovalAction,
+        auth_context: AuthContext,
+    ):
+        """验证业务关联并解析动作上下文；缺少运行时前先由状态机判定动作合法性。"""
         approval = await self._repository.get_application_for_action(approval_id)
         if approval is None:
             raise ApprovalError(ApprovalErrorCode.NOT_FOUND)
@@ -305,6 +314,22 @@ class ApprovalService:
             or not approval.current_task_id
             or not approval.current_node_code
         ):
+            # DRAFT / COMPLETED 本就没有当前任务；先让唯一状态机拒绝非法动作。
+            # 该合成上下文只用于通过状态与动作校验，不用于授权；IN_APPROVAL
+            # 后续仍会加载真实任务和处理人，再以完整上下文做最终决策。
+            actor_id = str(auth_context.user_id)
+            self._decide(
+                approval.status,
+                action,
+                TransitionContext(
+                    actor_id=actor_id,
+                    applicant_id=approval.applicant_id,
+                    current_assignee_ids=frozenset({actor_id}),
+                    reject_target_type=(
+                        RejectTargetType.APPLICANT if action is ApprovalAction.REJECT else None
+                    ),
+                ),
+            )
             raise ApprovalError(ApprovalErrorCode.DATA_INTEGRITY_ERROR)
         try:
             spec = await self._workflow_repository.get_by_code_version(code, version)
