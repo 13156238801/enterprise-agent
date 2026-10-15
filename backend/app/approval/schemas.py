@@ -57,4 +57,3 @@ class ApprovalActionResponse(BaseModel):
     current_node_code: str | None
     current_node_role: UserRole | None
     completed_at: datetime | None
-

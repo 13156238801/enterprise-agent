@@ -665,4 +665,3 @@ def test_postgres_approval_actions_runtime_history_permissions_and_rollback(monk
             await engine.dispose()
 
     asyncio.run(run())
-

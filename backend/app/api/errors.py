@@ -60,4 +60,3 @@ async def app_error_handler(request: Request, error: AppError) -> JSONResponse:
 def register_error_handlers(api: FastAPI) -> None:
     """为 FastAPI 应用注册统一应用错误处理器。"""
     api.add_exception_handler(AppError, app_error_handler)
-

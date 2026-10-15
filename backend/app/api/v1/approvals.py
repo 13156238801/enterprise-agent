@@ -48,4 +48,3 @@ async def reject_approval(
 ) -> ApprovalActionResponse:
     """执行已认证审批人的 reject 操作，不接受客户端指定节点或处理人。"""
     return await service.reject(approval_id, auth_context, payload.target, payload.comment)
-

@@ -386,4 +386,3 @@ def _action_response(
         current_node_role=current_node.role if current_node is not None else None,
         completed_at=approval.completed_at,
     )
-

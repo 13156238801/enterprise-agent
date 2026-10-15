@@ -34,4 +34,3 @@ class ApprovalError(AppError):
     def __init__(self, code: ApprovalErrorCode) -> None:
         """按错误码设置固定公开消息。"""
         super().__init__(code.value, _MESSAGES[code])
-
