@@ -10,6 +10,7 @@ from app.approval.schemas import (
     ApproveRequest,
     RejectRequest,
     SubmitApprovalResponse,
+    WithdrawRequest,
 )
 from app.approval.service import ApprovalService
 from app.auth.context import AuthContext
@@ -48,3 +49,14 @@ async def reject_approval(
 ) -> ApprovalActionResponse:
     """执行已认证审批人的 reject 操作，不接受客户端指定节点或处理人。"""
     return await service.reject(approval_id, auth_context, payload.target, payload.comment)
+
+
+@router.post("/{approval_id}/withdraw", response_model=ApprovalActionResponse)
+async def withdraw_approval(
+    approval_id: UUID,
+    payload: WithdrawRequest | None = None,
+    auth_context: AuthContext = Depends(require_any_role(UserRole.APPLICANT)),
+    service: ApprovalService = Depends(get_approval_service),
+) -> ApprovalActionResponse:
+    """撤回当前申请人的审批申请，不接受客户端提供申请人身份。"""
+    return await service.withdraw(approval_id, auth_context, payload.comment if payload else None)

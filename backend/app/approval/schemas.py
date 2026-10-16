@@ -42,6 +42,14 @@ class RejectRequest(BaseModel):
     comment: object
 
 
+class WithdrawRequest(BaseModel):
+    """接收可选撤回意见，不接受客户端指定身份或流程运行时字段。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    comment: object | None = None
+
+
 class ApprovalActionResponse(BaseModel):
     """返回审批动作结果和当前流程运行时，不暴露目标处理人。"""
 
