@@ -28,6 +28,8 @@ _APPROVAL_HTTP_STATUS = {
     ApprovalErrorCode.FORBIDDEN.value: 403,
     ApprovalErrorCode.WORKFLOW_NOT_CONFIGURED.value: 409,
     ApprovalErrorCode.DATA_INTEGRITY_ERROR.value: 500,
+    ApprovalErrorCode.INVALID_REQUEST.value: 422,
+    ApprovalErrorCode.REJECT_TARGET_UNAVAILABLE.value: 409,
 }
 
 
