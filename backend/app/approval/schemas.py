@@ -5,7 +5,7 @@ from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict
 
-from app.domain.approval.enums import ApprovalAction, ApprovalStatus
+from app.domain.approval.enums import ApprovalAction, ApprovalStatus, BusinessType
 from app.domain.auth.enums import UserRole
 
 
@@ -65,3 +65,103 @@ class ApprovalActionResponse(BaseModel):
     current_node_code: str | None
     current_node_role: UserRole | None
     completed_at: datetime | None
+
+
+class ApprovalListItem(BaseModel):
+    """定义审批列表摘要，不包含内部 task 或目标处理人信息。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    approval_id: UUID
+    business_type: BusinessType
+    status: ApprovalStatus
+    applicant_id: str
+    entity_type: str
+    entity_key: str
+    change_reason: str | None
+    workflow_code: str | None
+    workflow_version: int | None
+    current_node_code: str | None
+    current_node_role: UserRole | None
+    submitted_at: datetime | None
+    completed_at: datetime | None
+    created_at: datetime
+    updated_at: datetime
+    version: int
+
+
+class ApprovalListResponse(BaseModel):
+    """表示带 offset 分页元数据的审批列表。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    items: list[ApprovalListItem]
+    limit: int
+    offset: int
+    has_more: bool
+
+
+class MasterDataChangeDetail(BaseModel):
+    """返回草稿持久化的主数据快照与结构化差异。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    change_id: UUID
+    entity_type: str
+    entity_key: str
+    before_data: dict[str, object]
+    form_data: dict[str, object]
+    change_items: list[dict[str, object]]
+    change_reason: str | None
+    base_entity_version: int
+    created_at: datetime
+    updated_at: datetime
+
+
+class ApprovalDetailResponse(BaseModel):
+    """定义审批详情和结构化变更内容，不暴露 current task ID。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    approval_id: UUID
+    business_type: BusinessType
+    business_id: str
+    applicant_id: str
+    status: ApprovalStatus
+    workflow_code: str | None
+    workflow_version: int | None
+    workflow_instance_id: str | None
+    current_node_code: str | None
+    current_node_role: UserRole | None
+    submitted_at: datetime | None
+    completed_at: datetime | None
+    created_at: datetime
+    updated_at: datetime
+    version: int
+    change: MasterDataChangeDetail
+
+
+class ApprovalHistoryItem(BaseModel):
+    """定义可安全公开的审批历史快照，不包含内部 task 分配字段。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    record_id: UUID
+    operator_id: str
+    action: ApprovalAction
+    comment: str | None
+    from_status: ApprovalStatus | None
+    to_status: ApprovalStatus
+    from_node_code: str | None
+    from_node_name: str | None
+    target_node_code: str | None
+    target_node_name: str | None
+    created_at: datetime
+
+
+class ApprovalHistoryResponse(BaseModel):
+    """封装按时间正序排列的只读审批历史。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    items: list[ApprovalHistoryItem]
