@@ -2,7 +2,7 @@
 
 from uuid import UUID
 
-from sqlalchemy import and_, or_, select
+from sqlalchemy import and_, func, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
@@ -142,6 +142,31 @@ class ApprovalRepository:
         """追加状态变更记录并 flush，提交或回滚由 Service 事务负责。"""
         self._session.add(record)
         await self._session.flush()
+
+    async def update_application_if_version(
+        self,
+        approval_id: UUID,
+        expected_version: int,
+        values: dict[str, object],
+    ) -> int | None:
+        """以数据库版本条件一次性更新申请并递增 version，未命中时返回 None。"""
+        statement = (
+            update(ApprovalApplication)
+            .where(
+                ApprovalApplication.id == approval_id,
+                ApprovalApplication.version == expected_version,
+            )
+            .values(
+                **values,
+                version=ApprovalApplication.version + 1,
+                updated_at=func.now(),
+            )
+            .returning(ApprovalApplication.version)
+            .execution_options(synchronize_session=False)
+        )
+        with self._session.no_autoflush:
+            result = await self._session.execute(statement)
+        return result.scalar_one_or_none()
 
     async def get_task_creation_record(self, task_id: str) -> ApprovalRecord | None:
         """读取创建指定 task 的最新历史，用于解析定向处理人。"""

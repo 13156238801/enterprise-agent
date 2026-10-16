@@ -18,6 +18,7 @@ class ChangeDraftRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     draft_approval_id: UUID | None = None
+    expected_version: Any = None
     # 将业务校验留给 Service，确保错误经过统一 AppError Envelope。
     changes: Any
     reason: Any
@@ -46,6 +47,7 @@ class ChangeDraftResponse(BaseModel):
     """定义创建或更新草稿返回的完整 before/after/diff 视图。"""
 
     approval_id: UUID
+    approval_version: int
     change_id: UUID
     status: ApprovalStatus
     entity_type: str

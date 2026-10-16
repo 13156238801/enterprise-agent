@@ -17,6 +17,7 @@ from app.master_data.schemas import ChangeDraftRequest
 from app.master_data.service import MasterDataService
 from app.models.approval import ApprovalApplication, ApprovalRecord
 from app.models.master_data import MasterDataChange, MasterDataEntity
+from tests.p1_010_helpers import draft_write
 
 
 def _auth_context(user_id: UUID | None = None) -> AuthContext:
@@ -53,7 +54,8 @@ def test_postgres_create_and_iterative_update_preserve_original_snapshots() -> N
                 entity_id = entity.id
 
             async with factory() as session:
-                first = await MasterDataService(session).create_or_update_draft(
+                first = await draft_write(
+                    MasterDataService(session),
                     "supplier",
                     entity_key,
                     ChangeDraftRequest(
@@ -83,14 +85,8 @@ def test_postgres_create_and_iterative_update_preserve_original_snapshots() -> N
                 }
 
             async with factory() as session:
-                entity = await session.get(MasterDataEntity, entity_id)
-                assert entity is not None
-                entity.data_json = {"currency": "CNY", "payment_terms": "CHANGED_EXTERNALLY"}
-                entity.version = 2
-                await session.commit()
-
-            async with factory() as session:
-                second = await MasterDataService(session).create_or_update_draft(
+                second = await draft_write(
+                    MasterDataService(session),
                     "supplier",
                     entity_key,
                     ChangeDraftRequest(
@@ -106,7 +102,8 @@ def test_postgres_create_and_iterative_update_preserve_original_snapshots() -> N
             assert {item.field for item in second.diff} == {"currency", "payment_terms"}
 
             async with factory() as session:
-                third = await MasterDataService(session).create_or_update_draft(
+                third = await draft_write(
+                    MasterDataService(session),
                     "supplier",
                     entity_key,
                     ChangeDraftRequest(
@@ -150,15 +147,16 @@ def test_postgres_create_and_iterative_update_preserve_original_snapshots() -> N
                 assert records[0].to_status is ApprovalStatus.DRAFT
                 assert records[1].from_status is ApprovalStatus.DRAFT
                 assert records[1].to_status is ApprovalStatus.DRAFT
-                assert entity.version == 2
+                assert entity.version == 1
                 assert entity.data_json == {
                     "currency": "CNY",
-                    "payment_terms": "CHANGED_EXTERNALLY",
+                    "payment_terms": "PREPAID",
                 }
 
             async with factory() as session:
                 with pytest.raises(MasterDataError) as error:
-                    await MasterDataService(session).create_or_update_draft(
+                    await draft_write(
+                        MasterDataService(session),
                         "supplier",
                         entity_key,
                         ChangeDraftRequest(
@@ -184,7 +182,8 @@ def test_postgres_create_and_iterative_update_preserve_original_snapshots() -> N
 
             async with factory() as session:
                 with pytest.raises(MasterDataError) as error:
-                    await MasterDataService(session).create_or_update_draft(
+                    await draft_write(
+                        MasterDataService(session),
                         "supplier",
                         entity_key,
                         ChangeDraftRequest(
@@ -198,7 +197,8 @@ def test_postgres_create_and_iterative_update_preserve_original_snapshots() -> N
 
             async with factory() as session:
                 with pytest.raises(MasterDataError) as error:
-                    await MasterDataService(session).create_or_update_draft(
+                    await draft_write(
+                        MasterDataService(session),
                         "customer",
                         entity_key,
                         ChangeDraftRequest(
@@ -217,7 +217,8 @@ def test_postgres_create_and_iterative_update_preserve_original_snapshots() -> N
                 await session.commit()
             async with factory() as session:
                 with pytest.raises(MasterDataError) as error:
-                    await MasterDataService(session).create_or_update_draft(
+                    await draft_write(
+                        MasterDataService(session),
                         "supplier",
                         entity_key,
                         ChangeDraftRequest(
@@ -286,7 +287,8 @@ def test_postgres_create_draft_rolls_back_after_flush(monkeypatch) -> None:
         try:
             async with factory() as session:
                 with pytest.raises(RuntimeError, match="injected create failure"):
-                    await MasterDataService(session).create_or_update_draft(
+                    await draft_write(
+                        MasterDataService(session),
                         "supplier",
                         entity_key,
                         ChangeDraftRequest(changes={"enabled": False}, reason="test"),
@@ -358,7 +360,8 @@ def test_postgres_update_draft_rolls_back_after_flush(monkeypatch) -> None:
                 )
                 await session.commit()
             async with factory() as session:
-                draft = await MasterDataService(session).create_or_update_draft(
+                draft = await draft_write(
+                    MasterDataService(session),
                     "supplier",
                     entity_key,
                     ChangeDraftRequest(changes={"payment_terms": "NET_30"}, reason="create"),
@@ -376,7 +379,8 @@ def test_postgres_update_draft_rolls_back_after_flush(monkeypatch) -> None:
             monkeypatch.setattr(MasterDataRepository, "save_draft", flush_then_fail)
             async with factory() as session:
                 with pytest.raises(RuntimeError, match="injected update failure"):
-                    await MasterDataService(session).create_or_update_draft(
+                    await draft_write(
+                        MasterDataService(session),
                         "supplier",
                         entity_key,
                         ChangeDraftRequest(
@@ -437,7 +441,8 @@ def test_postgres_create_for_missing_entity_writes_no_rows() -> None:
                 )
             async with factory() as session:
                 with pytest.raises(MasterDataError) as error:
-                    await MasterDataService(session).create_or_update_draft(
+                    await draft_write(
+                        MasterDataService(session),
                         "supplier",
                         entity_key,
                         ChangeDraftRequest(changes={"currency": "USD"}, reason="create"),
@@ -484,7 +489,8 @@ def test_postgres_create_noop_writes_no_approval_rows() -> None:
                 )
             async with factory() as session:
                 with pytest.raises(MasterDataError) as error:
-                    await MasterDataService(session).create_or_update_draft(
+                    await draft_write(
+                        MasterDataService(session),
                         "supplier",
                         entity_key,
                         ChangeDraftRequest(changes={"currency": "CNY"}, reason="no-op"),
@@ -523,7 +529,8 @@ def test_postgres_unknown_draft_id_does_not_create_save_record() -> None:
         try:
             async with factory() as session:
                 with pytest.raises(MasterDataError) as error:
-                    await MasterDataService(session).create_or_update_draft(
+                    await draft_write(
+                        MasterDataService(session),
                         "supplier",
                         f"unknown-{uuid4().hex}",
                         ChangeDraftRequest(

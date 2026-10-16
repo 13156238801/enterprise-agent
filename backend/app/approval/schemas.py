@@ -1,6 +1,7 @@
 """定义审批操作 API 的请求与安全响应模型。"""
 
 from datetime import datetime
+from typing import Any
 from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict
@@ -23,6 +24,15 @@ class SubmitApprovalResponse(BaseModel):
     current_node_code: str
     current_node_role: UserRole
     submitted_at: datetime
+    version: int
+
+
+class SubmitApprovalRequest(BaseModel):
+    """接收提交动作的 expected version，缺失值交由 Service 稳定映射。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    expected_version: Any = None
 
 
 class ApproveRequest(BaseModel):
@@ -30,6 +40,7 @@ class ApproveRequest(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
+    expected_version: Any = None
     comment: object | None = None
 
 
@@ -40,6 +51,7 @@ class RejectRequest(BaseModel):
 
     target: object
     comment: object
+    expected_version: Any = None
 
 
 class WithdrawRequest(BaseModel):
@@ -47,6 +59,7 @@ class WithdrawRequest(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
+    expected_version: Any = None
     comment: object | None = None
 
 
@@ -65,6 +78,7 @@ class ApprovalActionResponse(BaseModel):
     current_node_code: str | None
     current_node_role: UserRole | None
     completed_at: datetime | None
+    version: int
 
 
 class ApprovalListItem(BaseModel):

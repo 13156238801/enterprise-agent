@@ -28,6 +28,7 @@ from app.master_data.service import MasterDataService
 from app.models.approval import ApprovalApplication, ApprovalRecord
 from app.models.master_data import MasterDataChange, MasterDataEntity
 from app.models.workflow import WorkflowDefinition
+from tests.p1_010_helpers import approval_write, draft_write
 
 
 def _auth_context(roles: frozenset[UserRole]) -> AuthContext:
@@ -56,7 +57,9 @@ def _client_for(auth: AuthContext, service: object) -> TestClient:
     api = create_app(settings)
     api.dependency_overrides[get_auth_service] = lambda: FakeAuthService()
     api.dependency_overrides[get_approval_service] = lambda: service
-    return TestClient(RequestIdMiddleware(api, settings))
+    return TestClient(
+        RequestIdMiddleware(api, settings), headers={"Idempotency-Key": "withdraw-api-test"}
+    )
 
 
 def _withdraw_response(approval_id: UUID) -> ApprovalActionResponse:
@@ -72,6 +75,7 @@ def _withdraw_response(approval_id: UUID) -> ApprovalActionResponse:
         current_node_code=None,
         current_node_role=None,
         completed_at=None,
+        version=2,
     )
 
 
@@ -88,7 +92,9 @@ def test_withdraw_api_requires_bearer_and_returns_request_id() -> None:
             raise AuthError(AuthErrorCode.UNAUTHENTICATED)
 
     api.dependency_overrides[get_auth_service] = lambda: UnauthenticatedService()
-    client = TestClient(RequestIdMiddleware(api, settings))
+    client = TestClient(
+        RequestIdMiddleware(api, settings), headers={"Idempotency-Key": "api-contract-test"}
+    )
     response = client.post(
         f"/api/v1/approvals/{uuid4()}/withdraw",
         headers={"X-Request-ID": "withdraw-auth"},
@@ -125,8 +131,10 @@ def test_withdraw_api_uses_applicant_coarse_role_gate(
             """初始化服务调用记录。"""
             self.calls = 0
 
-        async def withdraw(self, received_id, received_auth, comment=None):
-            """验证路由向 Service 传入路径 ID、可信身份和可选 comment。"""
+        async def withdraw(
+            self, received_id, received_auth, expected_version, comment, idempotency_key
+        ):
+            """验证路由传入路径 ID、可信身份、版本、意见和幂等键。"""
             assert received_id == approval_id
             assert received_auth is auth
             self.calls += 1
@@ -137,7 +145,7 @@ def test_withdraw_api_uses_applicant_coarse_role_gate(
     response = client.post(
         f"/api/v1/approvals/{approval_id}/withdraw",
         headers={"Authorization": "Bearer test-token"},
-        json={"comment": "撤回说明"},
+        json={"expected_version": 1, "comment": "撤回说明"},
     )
     assert response.status_code == expected_status
     if expected_code:
@@ -154,7 +162,13 @@ def test_withdraw_service_rejects_invalid_comment_before_database_access(comment
     service = ApprovalService(object())
     with pytest.raises(ApprovalError) as error:
         asyncio.run(
-            service.withdraw(uuid4(), _auth_context(frozenset({UserRole.APPLICANT})), comment)
+            service.withdraw(
+                uuid4(),
+                _auth_context(frozenset({UserRole.APPLICANT})),
+                expected_version=1,
+                comment=comment,
+                idempotency_key="invalid-comment",
+            )
         )
     assert error.value.code == ApprovalErrorCode.INVALID_REQUEST.value
 
@@ -166,7 +180,9 @@ def test_withdraw_error_code_maps_to_conflict_envelope() -> None:
     class FailingService:
         """模拟应用层返回稳定撤回限制错误。"""
 
-        async def withdraw(self, approval_id, auth_context, comment=None):
+        async def withdraw(
+            self, approval_id, auth_context, expected_version, comment, idempotency_key
+        ):
             """返回应用错误以验证 HTTP 边界状态码映射。"""
             raise AppError("APPROVAL_WITHDRAW_NOT_ALLOWED", "当前节点不允许撤回")
 
@@ -181,27 +197,29 @@ def test_withdraw_error_code_maps_to_conflict_envelope() -> None:
 
 
 def test_withdraw_api_accepts_no_body() -> None:
-    """验证撤回请求体可省略且 Service 收到空 comment。"""
+    """验证无 body 的撤回请求因 expected_version 缺失返回稳定 422。"""
     approval_id = uuid4()
     auth = _auth_context(frozenset({UserRole.APPLICANT}))
 
     class RecordingService:
         """记录可选请求体归一化前的服务参数。"""
 
-        async def withdraw(self, received_id, received_auth, comment=None):
-            """确认缺省 body 映射成 None comment 并返回成功视图。"""
+        async def withdraw(
+            self, received_id, received_auth, expected_version, comment, idempotency_key
+        ):
+            """确认缺省 body 的版本缺失并返回稳定请求错误。"""
             assert received_id == approval_id
             assert received_auth is auth
+            assert expected_version is None
             assert comment is None
-            return _withdraw_response(approval_id)
+            raise ApprovalError(ApprovalErrorCode.INVALID_REQUEST)
 
     response = _client_for(auth, RecordingService()).post(
         f"/api/v1/approvals/{approval_id}/withdraw",
         headers={"Authorization": "Bearer test-token"},
     )
-    assert response.status_code == 200
-    assert response.json()["action"] == "WITHDRAW"
-    assert response.json()["status"] == "DRAFT"
+    assert response.status_code == 422
+    assert response.json()["error"]["code"] == "APPROVAL_INVALID_REQUEST"
 
 
 def test_withdraw_structural_extra_fields_keep_fastapi_validation_behavior() -> None:
@@ -226,7 +244,7 @@ def test_withdraw_api_maps_invalid_business_comment_to_error_envelope(comment: o
     response = client.post(
         f"/api/v1/approvals/{uuid4()}/withdraw",
         headers={"Authorization": "Bearer test-token", "X-Request-ID": "withdraw-invalid"},
-        json={"comment": comment},
+        json={"expected_version": 1, "comment": comment},
     )
     assert response.status_code == 422
     assert response.json()["error"]["code"] == "APPROVAL_INVALID_REQUEST"
@@ -492,8 +510,12 @@ def test_postgres_approval_withdraw_lifecycle_integrity_and_rollback(monkeypatch
                 roles=frozenset({UserRole.APPLICANT}),
             )
             async with factory() as session:
-                result = await ApprovalService(session).withdraw(
-                    success_id, applicant_auth, "  please revise  "
+                result = await approval_write(
+                    ApprovalService(session),
+                    "withdraw",
+                    success_id,
+                    applicant_auth,
+                    "  please revise  ",
                 )
                 assert result.action is ApprovalAction.WITHDRAW
                 assert result.status is ApprovalStatus.DRAFT
@@ -521,7 +543,7 @@ def test_postgres_approval_withdraw_lifecycle_integrity_and_rollback(monkeypatch
                     application.current_node_code is None and application.current_node_name is None
                 )
                 assert application.submitted_at == old_submitted
-                assert application.completed_at is None and application.version == 1
+                assert application.completed_at is None and application.version == 2
                 assert change.before_data == {"name": "before"}
                 assert change.base_entity_version == 4
                 assert change.form_data == {"name": "after"}
@@ -540,7 +562,9 @@ def test_postgres_approval_withdraw_lifecycle_integrity_and_rollback(monkeypatch
 
             # 同一个首节点的 targeted-return task 仍可由申请人撤回；目标处理人不授权。
             async with factory() as session:
-                await ApprovalService(session).withdraw(targeted_id, applicant_auth, "   ")
+                await approval_write(
+                    ApprovalService(session), "withdraw", targeted_id, applicant_auth, "   "
+                )
             async with factory() as verify:
                 target_withdraw = await verify.scalar(
                     select(ApprovalRecord).where(
@@ -572,7 +596,9 @@ def test_postgres_approval_withdraw_lifecycle_integrity_and_rollback(monkeypatch
             for approval_id, expected_error in expected_errors.items():
                 async with factory() as session:
                     with pytest.raises(ApprovalError) as error:
-                        await ApprovalService(session).withdraw(approval_id, applicant_auth)
+                        await approval_write(
+                            ApprovalService(session), "withdraw", approval_id, applicant_auth
+                        )
                     assert error.value.code == expected_error.value
 
             task_operator_auth = AuthContext(
@@ -584,8 +610,11 @@ def test_postgres_approval_withdraw_lifecycle_integrity_and_rollback(monkeypatch
             )
             async with factory() as session:
                 with pytest.raises(ApprovalError) as error:
-                    await ApprovalService(session).withdraw(
-                        assigned_non_owner_id, task_operator_auth
+                    await approval_write(
+                        ApprovalService(session),
+                        "withdraw",
+                        assigned_non_owner_id,
+                        task_operator_auth,
                     )
                 assert error.value.code == ApprovalErrorCode.FORBIDDEN.value
 
@@ -601,7 +630,7 @@ def test_postgres_approval_withdraw_lifecycle_integrity_and_rollback(monkeypatch
                     service._workflow_repository, "get_by_code_version", missing_exact_version
                 )
                 with pytest.raises(ApprovalError) as error:
-                    await service.withdraw(rollback_id, applicant_auth)
+                    await approval_write(service, "withdraw", rollback_id, applicant_auth)
                 assert error.value.code == ApprovalErrorCode.DATA_INTEGRITY_ERROR.value
 
             # 用于回滚的合法案例：记录 flush 后注入失败，状态与历史必须一并回滚。
@@ -615,7 +644,9 @@ def test_postgres_approval_withdraw_lifecycle_integrity_and_rollback(monkeypatch
             monkeypatch.setattr(ApprovalRepository, "save_transition", flush_then_fail)
             with pytest.raises(RuntimeError, match="injected withdraw failure"):
                 async with factory() as session:
-                    await ApprovalService(session).withdraw(rollback_id, applicant_auth)
+                    await approval_write(
+                        ApprovalService(session), "withdraw", rollback_id, applicant_auth
+                    )
             monkeypatch.setattr(ApprovalRepository, "save_transition", original_save)
             async with factory() as verify:
                 rollback_application = await verify.get(ApprovalApplication, rollback_id)
@@ -653,7 +684,8 @@ def test_postgres_approval_withdraw_lifecycle_integrity_and_rollback(monkeypatch
 
             # 撤回后通过既有 SAVE 与 SUBMIT 服务继续处理，仍使用绑定 v1 而非 active v2。
             async with factory() as session:
-                saved = await MasterDataService(session).create_or_update_draft(
+                saved = await draft_write(
+                    MasterDataService(session),
                     "supplier",
                     entity_keys[0],
                     ChangeDraftRequest(
@@ -665,7 +697,9 @@ def test_postgres_approval_withdraw_lifecycle_integrity_and_rollback(monkeypatch
                 )
                 assert saved.approval_id == success_id
             async with factory() as session:
-                resubmitted = await ApprovalService(session).submit(success_id, applicant_auth)
+                resubmitted = await approval_write(
+                    ApprovalService(session), "submit", success_id, applicant_auth
+                )
                 assert resubmitted.status is ApprovalStatus.IN_APPROVAL
                 assert resubmitted.workflow_code == workflow_code
                 assert resubmitted.workflow_version == 1

@@ -46,7 +46,9 @@ def test_authenticated_get_returns_entity_without_sensitive_fields() -> None:
             }
 
     app.dependency_overrides[get_master_data_service] = lambda: Service()
-    with TestClient(RequestIdMiddleware(app, settings)) as client:
+    with TestClient(
+        RequestIdMiddleware(app, settings), headers={"Idempotency-Key": "master-data-contract-test"}
+    ) as client:
         response = client.get("/api/v1/master-data/supplier/supplier_a")
 
     assert response.status_code == 200
@@ -68,7 +70,9 @@ def test_applicant_can_create_draft_and_error_has_request_id() -> None:
             raise MasterDataError(MasterDataErrorCode.NO_CHANGE)
 
     app.dependency_overrides[get_master_data_service] = lambda: Service()
-    with TestClient(RequestIdMiddleware(app, settings)) as client:
+    with TestClient(
+        RequestIdMiddleware(app, settings), headers={"Idempotency-Key": "master-data-contract-test"}
+    ) as client:
         response = client.post(
             "/api/v1/master-data/supplier/supplier_a/changes",
             json={"changes": {"enabled": True}, "reason": "no-op"},
@@ -94,6 +98,7 @@ def test_applicant_draft_response_contains_structured_diff() -> None:
             """返回模拟 Service 生成的结构化草稿响应。"""
             return {
                 "approval_id": str(uuid4()),
+                "approval_version": 1,
                 "change_id": str(uuid4()),
                 "status": "DRAFT",
                 "entity_type": "supplier",
@@ -113,7 +118,9 @@ def test_applicant_draft_response_contains_structured_diff() -> None:
             }
 
     app.dependency_overrides[get_master_data_service] = lambda: Service()
-    with TestClient(RequestIdMiddleware(app, settings)) as client:
+    with TestClient(
+        RequestIdMiddleware(app, settings), headers={"Idempotency-Key": "master-data-api-test"}
+    ) as client:
         response = client.post(
             "/api/v1/master-data/supplier/supplier_a/changes",
             json={"changes": {"payment_terms": "NET_30"}, "reason": "更新账期"},
@@ -146,7 +153,10 @@ def test_approver_and_admin_cannot_create_applicant_drafts() -> None:
                 raise AssertionError("unauthorized role reached service")
 
         app.dependency_overrides[get_master_data_service] = lambda: Service()
-        with TestClient(RequestIdMiddleware(app, settings)) as client:
+        with TestClient(
+            RequestIdMiddleware(app, settings),
+            headers={"Idempotency-Key": "master-data-api-test"},
+        ) as client:
             response = client.post(
                 "/api/v1/master-data/supplier/supplier_a/changes",
                 json={"changes": {"enabled": False}, "reason": "test"},
@@ -161,7 +171,9 @@ def test_draft_request_rejects_client_supplied_identity() -> None:
     app = create_app(settings)
     app.dependency_overrides[get_current_auth] = lambda: _auth_context(UserRole.APPLICANT)
     app.dependency_overrides[get_master_data_service] = lambda: object()
-    with TestClient(RequestIdMiddleware(app, settings)) as client:
+    with TestClient(
+        RequestIdMiddleware(app, settings), headers={"Idempotency-Key": "master-data-contract-test"}
+    ) as client:
         response = client.post(
             "/api/v1/master-data/supplier/supplier_a/changes",
             json={
@@ -180,7 +192,9 @@ def test_invalid_changes_use_master_data_error_envelope() -> None:
     app = create_app(settings)
     app.dependency_overrides[get_current_auth] = lambda: _auth_context(UserRole.APPLICANT)
     app.dependency_overrides[get_master_data_service] = lambda: MasterDataService(None)
-    with TestClient(RequestIdMiddleware(app, settings)) as client:
+    with TestClient(
+        RequestIdMiddleware(app, settings), headers={"Idempotency-Key": "master-data-contract-test"}
+    ) as client:
         response = client.post(
             "/api/v1/master-data/supplier/supplier_a/changes",
             json={"changes": [], "reason": "test"},
@@ -198,7 +212,9 @@ def test_invalid_reason_uses_master_data_error_envelope() -> None:
     app = create_app(settings)
     app.dependency_overrides[get_current_auth] = lambda: _auth_context(UserRole.APPLICANT)
     app.dependency_overrides[get_master_data_service] = lambda: MasterDataService(None)
-    with TestClient(RequestIdMiddleware(app, settings)) as client:
+    with TestClient(
+        RequestIdMiddleware(app, settings), headers={"Idempotency-Key": "master-data-contract-test"}
+    ) as client:
         response = client.post(
             "/api/v1/master-data/supplier/supplier_a/changes",
             json={"changes": {"currency": "USD"}, "reason": "  "},
@@ -222,7 +238,10 @@ def test_invalid_change_variants_use_master_data_error_envelope() -> None:
         app = create_app(settings)
         app.dependency_overrides[get_current_auth] = lambda: _auth_context(UserRole.APPLICANT)
         app.dependency_overrides[get_master_data_service] = lambda: MasterDataService(None)
-        with TestClient(RequestIdMiddleware(app, settings)) as client:
+        with TestClient(
+            RequestIdMiddleware(app, settings),
+            headers={"Idempotency-Key": "master-data-contract-test"},
+        ) as client:
             response = client.post(
                 "/api/v1/master-data/supplier/supplier_a/changes",
                 content=body,
@@ -241,7 +260,9 @@ def test_unauthenticated_get_returns_bearer_challenge() -> None:
     settings = Settings(_env_file=None)
     app = create_app(settings)
     app.dependency_overrides[get_master_data_service] = lambda: object()
-    with TestClient(RequestIdMiddleware(app, settings)) as client:
+    with TestClient(
+        RequestIdMiddleware(app, settings), headers={"Idempotency-Key": "master-data-contract-test"}
+    ) as client:
         response = client.get("/api/v1/master-data/supplier/supplier_a")
 
     assert response.status_code == 401
