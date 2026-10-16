@@ -15,6 +15,7 @@ class MasterDataErrorCode(StrEnum):
     DRAFT_NOT_EDITABLE = "MASTER_DATA_DRAFT_NOT_EDITABLE"
     DRAFT_FORBIDDEN = "MASTER_DATA_DRAFT_FORBIDDEN"
     DRAFT_ENTITY_MISMATCH = "MASTER_DATA_DRAFT_ENTITY_MISMATCH"
+    VERSION_CONFLICT = "MASTER_DATA_VERSION_CONFLICT"
 
 
 _MESSAGES = {
@@ -25,6 +26,7 @@ _MESSAGES = {
     MasterDataErrorCode.DRAFT_NOT_EDITABLE: "当前草稿状态不允许修改",
     MasterDataErrorCode.DRAFT_FORBIDDEN: "只有原申请人可以修改该草稿",
     MasterDataErrorCode.DRAFT_ENTITY_MISMATCH: "路由实体与草稿实体不一致",
+    MasterDataErrorCode.VERSION_CONFLICT: "主数据或草稿版本已变化，请刷新后重试",
 }
 
 

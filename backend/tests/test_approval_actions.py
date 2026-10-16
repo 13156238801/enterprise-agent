@@ -29,6 +29,7 @@ from app.master_data.service import MasterDataService
 from app.models.approval import ApprovalApplication, ApprovalRecord
 from app.models.master_data import MasterDataChange, MasterDataEntity
 from app.models.workflow import WorkflowDefinition
+from tests.p1_010_helpers import approval_write, draft_write
 
 
 def _client_for(auth_context: AuthContext, service: object) -> TestClient:
@@ -46,7 +47,9 @@ def _client_for(auth_context: AuthContext, service: object) -> TestClient:
     api = create_app(settings)
     api.dependency_overrides[get_auth_service] = lambda: FakeAuthService()
     api.dependency_overrides[get_approval_service] = lambda: service
-    return TestClient(RequestIdMiddleware(api, settings))
+    return TestClient(
+        RequestIdMiddleware(api, settings), headers={"Idempotency-Key": "approval-api-test"}
+    )
 
 
 def _auth(roles: frozenset[UserRole], user_id: UUID | None = None) -> AuthContext:
@@ -73,7 +76,9 @@ def test_approve_and_reject_require_bearer_authentication() -> None:
             raise AuthError(AuthErrorCode.UNAUTHENTICATED)
 
     api.dependency_overrides[get_auth_service] = lambda: UnauthenticatedService()
-    client = TestClient(RequestIdMiddleware(api, settings))
+    client = TestClient(
+        RequestIdMiddleware(api, settings), headers={"Idempotency-Key": "api-contract-test"}
+    )
     approval_id = uuid4()
     for action, body in (("approve", {}), ("reject", {"target": "APPLICANT", "comment": "退回"})):
         response = client.post(f"/api/v1/approvals/{approval_id}/{action}", json=body)
@@ -124,7 +129,9 @@ def test_approve_and_reject_routes_allow_coarse_reviewer_roles(role: UserRole) -
 
         calls: list[tuple[str, object]] = []
 
-        async def approve(self, received_id, received_auth, comment=None):
+        async def approve(
+            self, received_id, received_auth, expected_version, comment, idempotency_key
+        ):
             """记录 approve 调用并构造测试响应。"""
             assert received_id == approval_id
             assert received_auth is auth_context
@@ -140,9 +147,18 @@ def test_approve_and_reject_routes_allow_coarse_reviewer_roles(role: UserRole) -
                 current_node_code="review",
                 current_node_role=role,
                 completed_at=None,
+                version=2,
             )
 
-        async def reject(self, received_id, received_auth, target, comment):
+        async def reject(
+            self,
+            received_id,
+            received_auth,
+            target,
+            comment,
+            expected_version,
+            idempotency_key,
+        ):
             """记录 reject 调用并构造测试响应。"""
             assert received_id == approval_id
             assert received_auth is auth_context
@@ -158,18 +174,21 @@ def test_approve_and_reject_routes_allow_coarse_reviewer_roles(role: UserRole) -
                 current_node_code=None,
                 current_node_role=None,
                 completed_at=None,
+                version=2,
             )
 
     service = RecordingService()
     client = _client_for(auth_context, service)
     headers = {"Authorization": "Bearer test-token"}
     approve = client.post(
-        f"/api/v1/approvals/{approval_id}/approve", headers=headers, json={"comment": "ok"}
+        f"/api/v1/approvals/{approval_id}/approve",
+        headers=headers,
+        json={"expected_version": 1, "comment": "ok"},
     )
     reject = client.post(
         f"/api/v1/approvals/{approval_id}/reject",
         headers=headers,
-        json={"target": "APPLICANT", "comment": "revise"},
+        json={"expected_version": 1, "target": "APPLICANT", "comment": "revise"},
     )
     assert approve.status_code == reject.status_code == 200
     assert [call[0] for call in service.calls] == ["approve", "reject"]
@@ -187,32 +206,32 @@ def test_approve_and_reject_invalid_comments_use_approval_error_envelope() -> No
         client.post(
             f"/api/v1/approvals/{approval_id}/approve",
             headers=headers,
-            json={"comment": "x" * 2001},
+            json={"expected_version": 1, "comment": "x" * 2001},
         ),
         client.post(
             f"/api/v1/approvals/{approval_id}/approve",
             headers=headers,
-            json={"comment": 42},
+            json={"expected_version": 1, "comment": 42},
         ),
         client.post(
             f"/api/v1/approvals/{approval_id}/reject",
             headers=headers,
-            json={"target": "INVALID", "comment": "退回"},
+            json={"expected_version": 1, "target": "INVALID", "comment": "退回"},
         ),
         client.post(
             f"/api/v1/approvals/{approval_id}/reject",
             headers=headers,
-            json={"target": "APPLICANT", "comment": " "},
+            json={"expected_version": 1, "target": "APPLICANT", "comment": " "},
         ),
         client.post(
             f"/api/v1/approvals/{approval_id}/reject",
             headers=headers,
-            json={"target": "APPLICANT", "comment": 42},
+            json={"expected_version": 1, "target": "APPLICANT", "comment": 42},
         ),
         client.post(
             f"/api/v1/approvals/{approval_id}/reject",
             headers=headers,
-            json={"target": "APPLICANT", "comment": "x" * 2001},
+            json={"expected_version": 1, "target": "APPLICANT", "comment": "x" * 2001},
         ),
     ]
     for response in responses:
@@ -242,6 +261,7 @@ def test_missing_runtime_defers_status_legality_to_state_machine() -> None:
                     workflow_instance_id=None,
                     current_task_id=None,
                     current_node_code=None,
+                    version=1,
                 )
                 service = ApprovalService(object())
 
@@ -253,7 +273,9 @@ def test_missing_runtime_defers_status_legality_to_state_machine() -> None:
                 service._repository.get_application_for_action = get_application_for_action
                 auth = _auth(frozenset({UserRole.APPROVER}))
                 with pytest.raises(ApprovalError) as error:
-                    await service._load_action_context(approval_id, action, auth)
+                    await service._load_action_context(
+                        approval_id, action, auth, expected_version=1
+                    )
                 assert error.value.code == ApprovalErrorCode.INVALID_TRANSITION.value
 
         approval_id = uuid4()
@@ -270,6 +292,7 @@ def test_missing_runtime_defers_status_legality_to_state_machine() -> None:
             workflow_instance_id=None,
             current_task_id=None,
             current_node_code=None,
+            version=1,
         )
         service = ApprovalService(object())
 
@@ -284,6 +307,7 @@ def test_missing_runtime_defers_status_legality_to_state_machine() -> None:
                 approval_id,
                 ApprovalAction.APPROVE,
                 _auth(frozenset({UserRole.APPROVER})),
+                expected_version=1,
             )
         assert error.value.code == ApprovalErrorCode.DATA_INTEGRITY_ERROR.value
 
@@ -369,7 +393,7 @@ def test_postgres_approval_actions_runtime_history_permissions_and_rollback(monk
             entity_type="supplier",
             entity_key=f"action-{uuid4().hex}",
             before_data={"name": "before"},
-            base_entity_version=1,
+            base_entity_version=3,
             form_data={"name": "after"},
             change_items=[{"field": "name", "operation": "UPDATE"}],
         )
@@ -515,8 +539,8 @@ def test_postgres_approval_actions_runtime_history_permissions_and_rollback(monk
             manager_auth = _auth(frozenset({UserRole.APPROVER}))
             data_admin_auth = _auth(frozenset({UserRole.DATA_ADMIN}))
             async with factory() as session:
-                result = await ApprovalService(session).approve(
-                    manager_id, manager_auth, "  同意  "
+                result = await approval_write(
+                    ApprovalService(session), "approve", manager_id, manager_auth, "  同意  "
                 )
                 assert result.status is ApprovalStatus.IN_APPROVAL
                 assert result.current_node_code == "data_admin_review"
@@ -527,7 +551,7 @@ def test_postgres_approval_actions_runtime_history_permissions_and_rollback(monk
                     assert application is not None
                     assert application.workflow_version == 1
                     assert application.submitted_at == submitted_at
-                    assert application.version == 1
+                    assert application.version == 2
                     record = await verify.scalar(
                         select(ApprovalRecord).where(
                             ApprovalRecord.approval_id == manager_id,
@@ -548,7 +572,9 @@ def test_postgres_approval_actions_runtime_history_permissions_and_rollback(monk
                 final_task_id = final_before.current_task_id
                 final_node_code = final_before.current_node_code
             async with factory() as session:
-                result = await ApprovalService(session).approve(final_id, data_admin_auth)
+                result = await approval_write(
+                    ApprovalService(session), "approve", final_id, data_admin_auth
+                )
                 assert result.status is ApprovalStatus.COMPLETED
                 assert result.current_task_id is None and result.current_node_code is None
                 assert result.current_node_role is None
@@ -561,7 +587,7 @@ def test_postgres_approval_actions_runtime_history_permissions_and_rollback(monk
                 assert completed.workflow_version == 1
                 assert completed.workflow_instance_id == final_workflow_instance
                 assert completed.submitted_at == final_submitted_at
-                assert completed.version == final_version
+                assert completed.version == final_version + 1
                 assert completed.current_task_id is None
                 assert completed.current_node_code is None
                 assert completed.current_node_name is None
@@ -582,8 +608,13 @@ def test_postgres_approval_actions_runtime_history_permissions_and_rollback(monk
                 assert final_record.target_node_name is None
                 assert final_record.target_operator_id is None
             async with factory() as session:
-                result = await ApprovalService(session).reject(
-                    reject_applicant_id, manager_auth, RejectTargetType.APPLICANT, "  请修改  "
+                result = await approval_write(
+                    ApprovalService(session),
+                    "reject",
+                    reject_applicant_id,
+                    manager_auth,
+                    RejectTargetType.APPLICANT,
+                    "  请修改  ",
                 )
                 assert result.status is ApprovalStatus.DRAFT
                 assert result.workflow_instance_id
@@ -601,8 +632,13 @@ def test_postgres_approval_actions_runtime_history_permissions_and_rollback(monk
 
             # 真实驳回产生无运行时字段的 DRAFT；P1-002 必须先判定状态非法。
             async with factory() as session:
-                result = await ApprovalService(session).reject(
-                    reject_resubmit_id, manager_auth, RejectTargetType.APPLICANT, "请修改后重提"
+                result = await approval_write(
+                    ApprovalService(session),
+                    "reject",
+                    reject_resubmit_id,
+                    manager_auth,
+                    RejectTargetType.APPLICANT,
+                    "请修改后重提",
                 )
                 assert result.status is ApprovalStatus.DRAFT
                 assert result.current_task_id is None and result.current_node_code is None
@@ -611,9 +647,13 @@ def test_postgres_approval_actions_runtime_history_permissions_and_rollback(monk
                     with pytest.raises(ApprovalError) as error:
                         service = ApprovalService(session)
                         if action == "approve":
-                            await service.approve(reject_resubmit_id, data_admin_auth)
+                            await approval_write(
+                                service, "approve", reject_resubmit_id, data_admin_auth
+                            )
                         else:
-                            await service.reject(
+                            await approval_write(
+                                service,
+                                "reject",
                                 reject_resubmit_id,
                                 data_admin_auth,
                                 RejectTargetType.APPLICANT,
@@ -631,7 +671,8 @@ def test_postgres_approval_actions_runtime_history_permissions_and_rollback(monk
                 original_entity_key = change.entity_key
                 original_workflow = (draft.workflow_code, draft.workflow_version)
             async with factory() as session:
-                updated = await MasterDataService(session).create_or_update_draft(
+                updated = await draft_write(
+                    MasterDataService(session),
                     "supplier",
                     original_entity_key,
                     ChangeDraftRequest(
@@ -643,7 +684,9 @@ def test_postgres_approval_actions_runtime_history_permissions_and_rollback(monk
                 )
                 assert updated.approval_id == reject_resubmit_id
             async with factory() as session:
-                resubmitted = await ApprovalService(session).submit(
+                resubmitted = await approval_write(
+                    ApprovalService(session),
+                    "submit",
                     reject_resubmit_id,
                     _auth(frozenset({UserRole.APPLICANT}), original_applicant_id),
                 )
@@ -672,9 +715,11 @@ def test_postgres_approval_actions_runtime_history_permissions_and_rollback(monk
                     with pytest.raises(ApprovalError) as error:
                         service = ApprovalService(session)
                         if action == "approve":
-                            await service.approve(final_id, data_admin_auth)
+                            await approval_write(service, "approve", final_id, data_admin_auth)
                         else:
-                            await service.reject(
+                            await approval_write(
+                                service,
+                                "reject",
                                 final_id,
                                 data_admin_auth,
                                 RejectTargetType.APPLICANT,
@@ -683,8 +728,13 @@ def test_postgres_approval_actions_runtime_history_permissions_and_rollback(monk
                     assert error.value.code == ApprovalErrorCode.INVALID_TRANSITION.value
 
             async with factory() as session:
-                result = await ApprovalService(session).reject(
-                    reject_previous_id, data_admin_auth, "PREVIOUS_NODE", "退回上一节点"
+                result = await approval_write(
+                    ApprovalService(session),
+                    "reject",
+                    reject_previous_id,
+                    data_admin_auth,
+                    "PREVIOUS_NODE",
+                    "退回上一节点",
                 )
                 assert result.status is ApprovalStatus.IN_APPROVAL
                 assert result.current_node_code == "manager_review"
@@ -702,7 +752,9 @@ def test_postgres_approval_actions_runtime_history_permissions_and_rollback(monk
                 assert targeted_record.target_task_id == result.current_task_id
                 assert targeted_record.comment == "退回上一节点"
             async with factory() as session:
-                returned = await ApprovalService(session).approve(
+                returned = await approval_write(
+                    ApprovalService(session),
+                    "approve",
                     reject_previous_id,
                     _auth(frozenset({UserRole.APPROVER}), UUID(previous_operator)),
                 )
@@ -710,24 +762,33 @@ def test_postgres_approval_actions_runtime_history_permissions_and_rollback(monk
 
             async with factory() as session:
                 with pytest.raises(ApprovalError) as error:
-                    await ApprovalService(session).approve(
-                        targeted_id, _auth(frozenset({UserRole.APPROVER}))
+                    await approval_write(
+                        ApprovalService(session),
+                        "approve",
+                        targeted_id,
+                        _auth(frozenset({UserRole.APPROVER})),
                     )
                 assert error.value.code == ApprovalErrorCode.FORBIDDEN.value
             async with factory() as session:
                 with pytest.raises(ApprovalError) as error:
-                    await ApprovalService(session).approve(
+                    await approval_write(
+                        ApprovalService(session),
+                        "approve",
                         wrong_role_id,
                         _auth(frozenset({UserRole.DATA_ADMIN}), UUID(previous_operator)),
                     )
                 assert error.value.code == ApprovalErrorCode.FORBIDDEN.value
             async with factory() as session:
                 with pytest.raises(ApprovalError) as error:
-                    await ApprovalService(session).approve(no_history_id, manager_auth)
+                    await approval_write(
+                        ApprovalService(session), "approve", no_history_id, manager_auth
+                    )
                 assert error.value.code == ApprovalErrorCode.DATA_INTEGRITY_ERROR.value
             async with factory() as session:
                 with pytest.raises(ApprovalError) as error:
-                    await ApprovalService(session).reject(
+                    await approval_write(
+                        ApprovalService(session),
+                        "reject",
                         no_previous_history_id,
                         data_admin_auth,
                         "PREVIOUS_NODE",
@@ -736,13 +797,18 @@ def test_postgres_approval_actions_runtime_history_permissions_and_rollback(monk
                 assert error.value.code == ApprovalErrorCode.DATA_INTEGRITY_ERROR.value
             async with factory() as session:
                 with pytest.raises(ApprovalError) as error:
-                    await ApprovalService(session).reject(
-                        first_node_reject_id, manager_auth, "PREVIOUS_NODE", "不应成功"
+                    await approval_write(
+                        ApprovalService(session),
+                        "reject",
+                        first_node_reject_id,
+                        manager_auth,
+                        "PREVIOUS_NODE",
+                        "不应成功",
                     )
                 assert error.value.code == ApprovalErrorCode.REJECT_TARGET_UNAVAILABLE.value
             async with factory() as session:
                 with pytest.raises(ApprovalError) as error:
-                    await ApprovalService(session).approve(uuid4(), manager_auth)
+                    await approval_write(ApprovalService(session), "approve", uuid4(), manager_auth)
                 assert error.value.code == ApprovalErrorCode.NOT_FOUND.value
             for invalid_id in (
                 missing_change_id,
@@ -753,7 +819,9 @@ def test_postgres_approval_actions_runtime_history_permissions_and_rollback(monk
             ):
                 async with factory() as session:
                     with pytest.raises(ApprovalError) as error:
-                        await ApprovalService(session).approve(invalid_id, manager_auth)
+                        await approval_write(
+                            ApprovalService(session), "approve", invalid_id, manager_auth
+                        )
                     assert error.value.code == ApprovalErrorCode.DATA_INTEGRITY_ERROR.value
             async with factory() as session:
                 service = ApprovalService(session)
@@ -768,7 +836,7 @@ def test_postgres_approval_actions_runtime_history_permissions_and_rollback(monk
                     missing_exact_workflow,
                 )
                 with pytest.raises(ApprovalError) as error:
-                    await service.approve(missing_exact_id, manager_auth)
+                    await approval_write(service, "approve", missing_exact_id, manager_auth)
                 assert error.value.code == ApprovalErrorCode.DATA_INTEGRITY_ERROR.value
 
             original_save = ApprovalRepository.save_transition
@@ -781,11 +849,18 @@ def test_postgres_approval_actions_runtime_history_permissions_and_rollback(monk
             monkeypatch.setattr(ApprovalRepository, "save_transition", flush_then_fail)
             async with factory() as session:
                 with pytest.raises(RuntimeError, match="injected action failure"):
-                    await ApprovalService(session).approve(rollback_approve_id, manager_auth)
+                    await approval_write(
+                        ApprovalService(session), "approve", rollback_approve_id, manager_auth
+                    )
             async with factory() as session:
                 with pytest.raises(RuntimeError, match="injected action failure"):
-                    await ApprovalService(session).reject(
-                        rollback_reject_id, data_admin_auth, "PREVIOUS_NODE", "rollback"
+                    await approval_write(
+                        ApprovalService(session),
+                        "reject",
+                        rollback_reject_id,
+                        data_admin_auth,
+                        "PREVIOUS_NODE",
+                        "rollback",
                     )
             monkeypatch.setattr(ApprovalRepository, "save_transition", original_save)
             async with factory() as session:

@@ -1,6 +1,6 @@
 """提供经过认证的主数据查询和 APPLICANT 草稿 API。"""
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, Header
 
 from app.api.deps import get_current_auth, get_master_data_service, require_any_role
 from app.auth.context import AuthContext
@@ -34,6 +34,7 @@ async def create_or_update_change_draft(
     entity_type: str,
     entity_key: str,
     payload: ChangeDraftRequest,
+    idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
     auth_context: AuthContext = Depends(require_any_role(UserRole.APPLICANT)),
     service: MasterDataService = Depends(get_master_data_service),
 ) -> ChangeDraftResponse:
@@ -43,4 +44,5 @@ async def create_or_update_change_draft(
         entity_key,
         payload,
         auth_context,
+        idempotency_key,
     )

@@ -47,6 +47,8 @@ def test_metadata_contains_approval_and_auth_tables() -> None:
         "auth_sessions",
         "workflow_definitions",
         "master_data_entities",
+        "idempotency_records",
+        "audit_logs",
     }
 
 

@@ -5,6 +5,7 @@ from app.domain.auth.enums import UserRole
 from app.infrastructure.database import Base
 from app.models.approval import ApprovalApplication, ApprovalRecord
 from app.models.auth import AuthSession, User, UserRoleAssignment
+from app.models.governance import AuditLog, IdempotencyRecord
 from app.models.master_data import MasterDataChange, MasterDataEntity
 from app.models.workflow import WorkflowDefinition
 
@@ -13,11 +14,13 @@ __all__ = [
     "ApprovalApplication",
     "ApprovalRecord",
     "ApprovalStatus",
+    "AuditLog",
     "AuthSession",
     "Base",
     "BusinessType",
     "MasterDataChange",
     "MasterDataEntity",
+    "IdempotencyRecord",
     "User",
     "UserRole",
     "UserRoleAssignment",

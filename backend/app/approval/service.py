@@ -3,6 +3,7 @@
 from datetime import UTC, datetime
 from uuid import UUID, uuid4
 
+from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.approval.errors import ApprovalError, ApprovalErrorCode
@@ -17,6 +18,7 @@ from app.approval.schemas import (
     MasterDataChangeDetail,
     SubmitApprovalResponse,
 )
+from app.audit.repository import AuditRepository
 from app.auth.context import AuthContext
 from app.domain.approval.context import RejectTargetType, TransitionContext
 from app.domain.approval.enums import ApprovalAction, ApprovalStatus, BusinessType
@@ -25,9 +27,23 @@ from app.domain.approval.state_machine import decide_transition
 from app.domain.auth.enums import UserRole
 from app.domain.workflow.definition import WorkflowDefinitionSpec, WorkflowNodeDefinition
 from app.domain.workflow.errors import WorkflowDefinitionError
+from app.idempotency.service import (
+    IdempotencyClaim,
+    IdempotencyService,
+    canonical_request_hash,
+    normalize_idempotency_key,
+)
+from app.master_data.repository import MasterDataRepository
 from app.models.approval import ApprovalApplication, ApprovalRecord
 from app.models.master_data import MasterDataChange
 from app.workflow.repository import WorkflowDefinitionRepository
+
+
+def validate_expected_version(value: object) -> int:
+    """严格校验审批 expected_version，避免 bool 被当作整数接受。"""
+    if type(value) is not int or value <= 0:
+        raise ApprovalError(ApprovalErrorCode.INVALID_REQUEST)
+    return value
 
 
 class ApprovalService:
@@ -38,6 +54,60 @@ class ApprovalService:
         self._session = session
         self._repository = ApprovalRepository(session)
         self._workflow_repository = WorkflowDefinitionRepository(session)
+        self._master_data_repository = MasterDataRepository(session)
+        self._idempotency = IdempotencyService(session)
+        self._audit = AuditRepository(session)
+
+    async def _claim_write(
+        self,
+        actor_id: str,
+        key: str,
+        action: str,
+        resource_type: str,
+        resource_id: str,
+        request_hash: str,
+    ) -> IdempotencyClaim:
+        """在当前写事务内按 actor、key、action、resource 和指纹 claim。"""
+        return await self._idempotency.claim(
+            actor_id=actor_id,
+            key=key,
+            action=action,
+            resource_type=resource_type,
+            resource_id=resource_id,
+            request_hash=request_hash,
+        )
+
+    async def _cas_application(
+        self, approval_id: UUID, expected_version: int, values: dict[str, object]
+    ) -> int:
+        """执行审批申请条件更新；零行命中统一映射版本冲突。"""
+        version = await self._repository.update_application_if_version(
+            approval_id, expected_version, values
+        )
+        if version is None:
+            raise ApprovalError(ApprovalErrorCode.VERSION_CONFLICT)
+        return version
+
+    async def _finish_write(
+        self,
+        claim: IdempotencyClaim,
+        response: BaseModel,
+        *,
+        actor_id: str,
+        action: str,
+        resource_type: str,
+        resource_id: str,
+        metadata_json: dict[str, object],
+    ) -> None:
+        """在同一事务追加白名单审计事实并持久化可重放响应。"""
+        await self._audit.append(
+            actor_id=actor_id,
+            action=action,
+            resource_type=resource_type,
+            resource_id=resource_id,
+            metadata_json=metadata_json,
+        )
+        await self._idempotency.complete(claim, response)
 
     async def list_my_approvals(
         self,
@@ -327,37 +397,49 @@ class ApprovalService:
         if approval.status is ApprovalStatus.COMPLETED and ApprovalAction.APPROVE not in actions:
             raise ApprovalError(ApprovalErrorCode.DATA_INTEGRITY_ERROR)
 
-    async def submit(self, approval_id: UUID, auth_context: AuthContext) -> SubmitApprovalResponse:
-        """验证并提交申请，绑定流程版本、初始化首节点并追加 SUBMIT 历史。"""
+    async def submit(
+        self,
+        approval_id: UUID,
+        auth_context: AuthContext,
+        expected_version: object = None,
+        idempotency_key: object = None,
+    ) -> SubmitApprovalResponse:
+        """以幂等 claim 和数据库 CAS 原子提交申请并返回新版本。"""
+        expected = validate_expected_version(expected_version)
+        key = normalize_idempotency_key(idempotency_key)
+        actor_id = str(auth_context.user_id)
+        request_hash = canonical_request_hash({"expected_version": expected})
         async with self._session.begin():
+            claim = await self._claim_write(
+                actor_id,
+                key,
+                "APPROVAL_SUBMIT",
+                "approval",
+                str(approval_id),
+                request_hash,
+            )
+            if not claim.is_new:
+                return self._idempotency.replay(claim, SubmitApprovalResponse)
             approval = await self._repository.get_application_for_action(approval_id)
             if approval is None:
                 raise ApprovalError(ApprovalErrorCode.NOT_FOUND)
-            change = approval.master_data_change
-            if (
-                approval.business_type is not BusinessType.MASTER_DATA_CHANGE
-                or change is None
-                or approval.business_id != str(change.id)
-            ):
-                raise ApprovalError(ApprovalErrorCode.DATA_INTEGRITY_ERROR)
+            change = self._validate_business_link(approval)
+            if approval.version != expected:
+                raise ApprovalError(ApprovalErrorCode.VERSION_CONFLICT)
+            decision = self._decide(
+                approval.status,
+                ApprovalAction.SUBMIT,
+                TransitionContext(actor_id=actor_id, applicant_id=approval.applicant_id),
+            )
+            entity = await self._master_data_repository.get_entity(
+                change.entity_type, change.entity_key
+            )
+            if entity is None or entity.version != change.base_entity_version:
+                raise ApprovalError(ApprovalErrorCode.VERSION_CONFLICT)
 
-            try:
-                decision = decide_transition(
-                    current_status=approval.status,
-                    action=ApprovalAction.SUBMIT,
-                    context=TransitionContext(
-                        actor_id=str(auth_context.user_id),
-                        applicant_id=approval.applicant_id,
-                    ),
-                )
-            except ApprovalTransitionError as error:
-                if error.code is ApprovalTransitionErrorCode.INVALID_STATUS_ACTION:
-                    raise ApprovalError(ApprovalErrorCode.INVALID_TRANSITION) from error
-                if error.code is ApprovalTransitionErrorCode.ACTOR_NOT_APPLICANT:
-                    raise ApprovalError(ApprovalErrorCode.FORBIDDEN) from error
-                raise ApprovalError(ApprovalErrorCode.DATA_INTEGRITY_ERROR) from error
-
-            code, version, spec = await self._resolve_workflow(approval, change.entity_type)
+            code, workflow_version, spec = await self._resolve_workflow(
+                approval, change.entity_type
+            )
             first_node = spec.first_node()
             previous_task_id = approval.current_task_id
             previous_node_code = approval.current_node_code
@@ -365,21 +447,25 @@ class ApprovalService:
             workflow_instance_id = str(uuid4())
             current_task_id = str(uuid4())
             submitted_at = datetime.now(UTC)
-
-            approval.workflow_code = code
-            approval.workflow_version = version
-            approval.status = decision.to_status
-            approval.workflow_instance_id = workflow_instance_id
-            approval.current_task_id = current_task_id
-            approval.current_node_code = first_node.key
-            approval.current_node_name = None
-            approval.submitted_at = submitted_at
-            approval.completed_at = None
-
+            new_version = await self._cas_application(
+                approval_id,
+                expected,
+                {
+                    "status": decision.to_status,
+                    "workflow_code": code,
+                    "workflow_version": workflow_version,
+                    "workflow_instance_id": workflow_instance_id,
+                    "current_task_id": current_task_id,
+                    "current_node_code": first_node.key,
+                    "current_node_name": None,
+                    "submitted_at": submitted_at,
+                    "completed_at": None,
+                },
+            )
             await self._repository.save_transition(
                 ApprovalRecord(
                     approval_id=approval.id,
-                    operator_id=str(auth_context.user_id),
+                    operator_id=actor_id,
                     action=decision.action,
                     from_status=decision.from_status,
                     to_status=decision.to_status,
@@ -392,18 +478,37 @@ class ApprovalService:
                     target_operator_id=None,
                 )
             )
-
-            return SubmitApprovalResponse(
+            response = SubmitApprovalResponse(
                 approval_id=approval.id,
                 status=decision.to_status,
                 workflow_code=code,
-                workflow_version=version,
+                workflow_version=workflow_version,
                 workflow_instance_id=workflow_instance_id,
                 current_task_id=current_task_id,
                 current_node_code=first_node.key,
                 current_node_role=first_node.role,
                 submitted_at=submitted_at,
+                version=new_version,
             )
+            await self._finish_write(
+                claim,
+                response,
+                actor_id=actor_id,
+                action="APPROVAL_SUBMIT",
+                resource_type="approval",
+                resource_id=str(approval.id),
+                metadata_json={
+                    "approval_id": str(approval.id),
+                    "from_status": decision.from_status.value,
+                    "to_status": decision.to_status.value,
+                    "from_version": expected,
+                    "to_version": new_version,
+                    "workflow_code": code,
+                    "workflow_version": workflow_version,
+                    "target_node_code": first_node.key,
+                },
+            )
+        return response
 
     async def _resolve_workflow(
         self, approval: ApprovalApplication, entity_type: str
@@ -433,15 +538,30 @@ class ApprovalService:
             raise ApprovalError(ApprovalErrorCode.DATA_INTEGRITY_ERROR) from error
 
     async def approve(
-        self, approval_id: UUID, auth_context: AuthContext, comment: object = None
+        self,
+        approval_id: UUID,
+        auth_context: AuthContext,
+        expected_version: object = None,
+        comment: object = None,
+        idempotency_key: object = None,
     ) -> ApprovalActionResponse:
-        """在单一事务中执行 APPROVE 状态迁移并追加不可变审批历史。"""
+        """以状态机决策和数据库 CAS 原子通过当前审批节点。"""
+        expected = validate_expected_version(expected_version)
         normalized_comment = _normalize_approve_comment(comment)
+        key = normalize_idempotency_key(idempotency_key)
+        actor_id = str(auth_context.user_id)
+        request_hash = canonical_request_hash(
+            {"expected_version": expected, "comment": normalized_comment}
+        )
         async with self._session.begin():
-            approval, spec, current_node, assignment = await self._load_action_context(
-                approval_id, ApprovalAction.APPROVE, auth_context
+            claim = await self._claim_write(
+                actor_id, key, "APPROVAL_APPROVE", "approval", str(approval_id), request_hash
             )
-            actor_id = str(auth_context.user_id)
+            if not claim.is_new:
+                return self._idempotency.replay(claim, ApprovalActionResponse)
+            approval, spec, current_node, assignment = await self._load_action_context(
+                approval_id, ApprovalAction.APPROVE, auth_context, expected_version=expected
+            )
             eligible = current_node.role in auth_context.roles and (
                 assignment.target_operator_id is None or assignment.target_operator_id == actor_id
             )
@@ -458,23 +578,27 @@ class ApprovalService:
             old_node_name = approval.current_node_name
             target_task_id: str | None = None
             target_node = None
-
+            completed_at = None
             if decision.to_status is ApprovalStatus.COMPLETED:
-                approval.current_task_id = None
-                approval.current_node_code = None
-                approval.current_node_name = None
-                approval.completed_at = datetime.now(UTC)
+                completed_at = datetime.now(UTC)
+                next_task_id = next_node_code = None
             else:
                 target_node = spec.next_node(current_node.key)
                 if target_node is None:
                     raise ApprovalError(ApprovalErrorCode.DATA_INTEGRITY_ERROR)
                 target_task_id = str(uuid4())
-                approval.current_task_id = target_task_id
-                approval.current_node_code = target_node.key
-                approval.current_node_name = None
-                approval.completed_at = None
-
-            approval.status = decision.to_status
+                next_task_id, next_node_code = target_task_id, target_node.key
+            new_version = await self._cas_application(
+                approval_id,
+                expected,
+                {
+                    "status": decision.to_status,
+                    "current_task_id": next_task_id,
+                    "current_node_code": next_node_code,
+                    "current_node_name": None,
+                    "completed_at": completed_at,
+                },
+            )
             await self._repository.save_transition(
                 ApprovalRecord(
                     approval_id=approval.id,
@@ -492,7 +616,34 @@ class ApprovalService:
                     target_operator_id=None,
                 )
             )
-            return _action_response(approval, decision.action, target_node)
+            response = _action_response(
+                approval,
+                decision.action,
+                target_node,
+                status=decision.to_status,
+                current_task_id=target_task_id,
+                current_node_code=target_node.key if target_node is not None else None,
+                completed_at=completed_at,
+                version=new_version,
+            )
+            await self._finish_write(
+                claim,
+                response,
+                actor_id=actor_id,
+                action="APPROVAL_APPROVE",
+                resource_type="approval",
+                resource_id=str(approval.id),
+                metadata_json={
+                    "approval_id": str(approval.id),
+                    "from_status": decision.from_status.value,
+                    "to_status": decision.to_status.value,
+                    "from_version": expected,
+                    "to_version": new_version,
+                    "from_node_code": old_node_code,
+                    "target_node_code": target_node.key if target_node is not None else None,
+                },
+            )
+        return response
 
     async def reject(
         self,
@@ -500,12 +651,29 @@ class ApprovalService:
         auth_context: AuthContext,
         target: object,
         comment: object,
+        expected_version: object = None,
+        idempotency_key: object = None,
     ) -> ApprovalActionResponse:
-        """解析可信驳回目标后执行 REJECT 决策并原子更新运行时与历史。"""
+        """解析可信驳回目标后以 CAS 更新运行时、历史、审计和重放结果。"""
+        expected = validate_expected_version(expected_version)
         reject_target, normalized_comment = _normalize_reject_request(target, comment)
+        key = normalize_idempotency_key(idempotency_key)
+        actor_id = str(auth_context.user_id)
+        request_hash = canonical_request_hash(
+            {
+                "expected_version": expected,
+                "target": reject_target.value,
+                "comment": normalized_comment,
+            }
+        )
         async with self._session.begin():
+            claim = await self._claim_write(
+                actor_id, key, "APPROVAL_REJECT", "approval", str(approval_id), request_hash
+            )
+            if not claim.is_new:
+                return self._idempotency.replay(claim, ApprovalActionResponse)
             approval, spec, current_node, assignment = await self._load_action_context(
-                approval_id, ApprovalAction.REJECT, auth_context
+                approval_id, ApprovalAction.REJECT, auth_context, expected_version=expected
             )
             target_node = None
             target_operator_id = None
@@ -521,7 +689,6 @@ class ApprovalService:
                         raise ApprovalError(ApprovalErrorCode.DATA_INTEGRITY_ERROR)
                     target_operator_id = previous_record.operator_id
 
-            actor_id = str(auth_context.user_id)
             eligible = current_node.role in auth_context.roles and (
                 assignment.target_operator_id is None or assignment.target_operator_id == actor_id
             )
@@ -554,20 +721,26 @@ class ApprovalService:
             old_node_code = approval.current_node_code
             old_node_name = approval.current_node_name
             target_task_id = None
+            next_node_code = None
             if reject_target is RejectTargetType.APPLICANT:
-                approval.current_task_id = None
-                approval.current_node_code = None
-                approval.current_node_name = None
-                approval.completed_at = None
+                next_task_id = None
             else:
                 if target_node is None or target_operator_id is None:
                     raise ApprovalError(ApprovalErrorCode.DATA_INTEGRITY_ERROR)
                 target_task_id = str(uuid4())
-                approval.current_task_id = target_task_id
-                approval.current_node_code = target_node.key
-                approval.current_node_name = None
-                approval.completed_at = None
-            approval.status = decision.to_status
+                next_task_id = target_task_id
+                next_node_code = target_node.key
+            new_version = await self._cas_application(
+                approval_id,
+                expected,
+                {
+                    "status": decision.to_status,
+                    "current_task_id": next_task_id,
+                    "current_node_code": next_node_code,
+                    "current_node_name": None,
+                    "completed_at": None,
+                },
+            )
 
             await self._repository.save_transition(
                 ApprovalRecord(
@@ -586,19 +759,62 @@ class ApprovalService:
                     target_operator_id=target_operator_id,
                 )
             )
-            return _action_response(approval, decision.action, target_node)
+            response = _action_response(
+                approval,
+                decision.action,
+                target_node,
+                status=decision.to_status,
+                current_task_id=target_task_id,
+                current_node_code=next_node_code,
+                completed_at=None,
+                version=new_version,
+            )
+            await self._finish_write(
+                claim,
+                response,
+                actor_id=actor_id,
+                action="APPROVAL_REJECT",
+                resource_type="approval",
+                resource_id=str(approval.id),
+                metadata_json={
+                    "approval_id": str(approval.id),
+                    "from_status": decision.from_status.value,
+                    "to_status": decision.to_status.value,
+                    "from_version": expected,
+                    "to_version": new_version,
+                    "from_node_code": old_node_code,
+                    "target_node_code": next_node_code,
+                },
+            )
+        return response
 
     async def withdraw(
-        self, approval_id: UUID, auth_context: AuthContext, comment: object = None
+        self,
+        approval_id: UUID,
+        auth_context: AuthContext,
+        expected_version: object = None,
+        comment: object = None,
+        idempotency_key: object = None,
     ) -> ApprovalActionResponse:
-        """在一个事务中撤回首节点申请并追加 WITHDRAW 历史，不修改主数据。"""
+        """以状态机决策和 CAS 原子撤回并保存审计及幂等响应。"""
+        expected = validate_expected_version(expected_version)
         normalized_comment = _normalize_withdraw_comment(comment)
+        key = normalize_idempotency_key(idempotency_key)
+        actor_id = str(auth_context.user_id)
+        request_hash = canonical_request_hash(
+            {"expected_version": expected, "comment": normalized_comment}
+        )
         async with self._session.begin():
+            claim = await self._claim_write(
+                actor_id, key, "APPROVAL_WITHDRAW", "approval", str(approval_id), request_hash
+            )
+            if not claim.is_new:
+                return self._idempotency.replay(claim, ApprovalActionResponse)
             approval, spec, current_node, _assignment = await self._load_action_context(
-                approval_id, ApprovalAction.WITHDRAW, auth_context
+                approval_id, ApprovalAction.WITHDRAW, auth_context, expected_version=expected
             )
             context = TransitionContext(
-                actor_id=str(auth_context.user_id),
+                actor_id=actor_id,
                 applicant_id=approval.applicant_id,
                 is_first_approval_node=spec.is_first_node(current_node.key),
             )
@@ -606,15 +822,21 @@ class ApprovalService:
             old_task_id = approval.current_task_id
             old_node_code = approval.current_node_code
             old_node_name = approval.current_node_name
-            approval.status = decision.to_status
-            approval.current_task_id = None
-            approval.current_node_code = None
-            approval.current_node_name = None
-            approval.completed_at = None
+            new_version = await self._cas_application(
+                approval_id,
+                expected,
+                {
+                    "status": decision.to_status,
+                    "current_task_id": None,
+                    "current_node_code": None,
+                    "current_node_name": None,
+                    "completed_at": None,
+                },
+            )
             await self._repository.save_transition(
                 ApprovalRecord(
                     approval_id=approval.id,
-                    operator_id=str(auth_context.user_id),
+                    operator_id=actor_id,
                     action=decision.action,
                     comment=normalized_comment,
                     from_status=decision.from_status,
@@ -628,13 +850,41 @@ class ApprovalService:
                     target_operator_id=approval.applicant_id,
                 )
             )
-            return _action_response(approval, decision.action, None)
+            response = _action_response(
+                approval,
+                decision.action,
+                None,
+                status=decision.to_status,
+                current_task_id=None,
+                current_node_code=None,
+                completed_at=None,
+                version=new_version,
+            )
+            await self._finish_write(
+                claim,
+                response,
+                actor_id=actor_id,
+                action="APPROVAL_WITHDRAW",
+                resource_type="approval",
+                resource_id=str(approval.id),
+                metadata_json={
+                    "approval_id": str(approval.id),
+                    "from_status": decision.from_status.value,
+                    "to_status": decision.to_status.value,
+                    "from_version": expected,
+                    "to_version": new_version,
+                    "from_node_code": old_node_code,
+                },
+            )
+        return response
 
     async def _load_action_context(
         self,
         approval_id: UUID,
         action: ApprovalAction,
         auth_context: AuthContext,
+        *,
+        expected_version: int,
     ):
         """验证业务关联并解析动作上下文；缺少运行时前先由状态机判定动作合法性。"""
         approval = await self._repository.get_application_for_action(approval_id)
@@ -647,6 +897,9 @@ class ApprovalService:
             or approval.business_id != str(change.id)
         ):
             raise ApprovalError(ApprovalErrorCode.DATA_INTEGRITY_ERROR)
+        # 已知过期版本先返回冲突；并发事务都读到同版时仍只由下方 CAS 决胜。
+        if approval.version != expected_version:
+            raise ApprovalError(ApprovalErrorCode.VERSION_CONFLICT)
         code, version = approval.workflow_code, approval.workflow_version
         if (
             not code
@@ -749,6 +1002,12 @@ def _action_response(
     approval: ApprovalApplication,
     action: ApprovalAction,
     current_node,
+    *,
+    status: ApprovalStatus,
+    current_task_id: str | None,
+    current_node_code: str | None,
+    completed_at,
+    version: int,
 ) -> ApprovalActionResponse:
     """从迁移后的申请构造不暴露内部目标处理人的动作响应。"""
     if (
@@ -760,12 +1019,13 @@ def _action_response(
     return ApprovalActionResponse(
         approval_id=approval.id,
         action=action,
-        status=approval.status,
+        status=status,
         workflow_code=approval.workflow_code,
         workflow_version=approval.workflow_version,
         workflow_instance_id=approval.workflow_instance_id,
-        current_task_id=approval.current_task_id,
-        current_node_code=approval.current_node_code,
+        current_task_id=current_task_id,
+        current_node_code=current_node_code,
         current_node_role=current_node.role if current_node is not None else None,
-        completed_at=approval.completed_at,
+        completed_at=completed_at,
+        version=version,
     )

@@ -1,0 +1,1107 @@
+"""验证 P1-010 幂等、CAS 与审计治理行为。"""
+
+import asyncio
+from datetime import UTC, datetime, timedelta
+from uuid import uuid4
+
+import pytest
+from fastapi.testclient import TestClient
+from pydantic import BaseModel
+from sqlalchemy import delete, func, select
+
+from app.api.deps import get_approval_service, get_current_auth, get_master_data_service
+from app.approval.errors import ApprovalError, ApprovalErrorCode
+from app.approval.repository import ApprovalRepository
+from app.approval.service import ApprovalService
+from app.audit.repository import AuditRepository
+from app.auth.context import AuthContext
+from app.core.config import get_settings
+from app.core.request_context import RequestIdMiddleware
+from app.domain.approval.enums import ApprovalAction, ApprovalStatus, BusinessType
+from app.domain.auth.enums import UserRole
+from app.domain.workflow.definition import WorkflowDefinitionSpec, WorkflowNodeDefinition
+from app.idempotency.errors import IdempotencyError, IdempotencyErrorCode
+from app.idempotency.service import (
+    IdempotencyService,
+    canonical_request_hash,
+    normalize_idempotency_key,
+)
+from app.infrastructure.database import create_db_engine, create_session_factory
+from app.main import create_app
+from app.master_data.errors import MasterDataError, MasterDataErrorCode
+from app.master_data.schemas import ChangeDraftRequest
+from app.master_data.service import MasterDataService
+from app.models.approval import ApprovalApplication, ApprovalRecord
+from app.models.governance import AuditLog, IdempotencyRecord
+from app.models.master_data import MasterDataChange, MasterDataEntity
+from app.models.workflow import WorkflowDefinition
+
+
+def test_idempotency_key_is_stripped_but_case_sensitive() -> None:
+    """验证幂等键先去除首尾空白且保留大小写差异。"""
+    assert normalize_idempotency_key("  Task-Key ") == "Task-Key"
+    assert normalize_idempotency_key("task-key") == "task-key"
+
+
+@pytest.mark.parametrize("key", [None, "", "   ", "x" * 201])
+def test_invalid_idempotency_key_is_rejected(key: object) -> None:
+    """验证缺失、空白和超长幂等键不能进入业务写入。"""
+    with pytest.raises(IdempotencyError):
+        normalize_idempotency_key(key)
+
+
+def test_request_hash_canonicalizes_json_object_key_order() -> None:
+    """验证等价 JSON 对象键顺序得到相同 SHA-256 请求指纹。"""
+    first = canonical_request_hash({"expected_version": 2, "changes": {"a": 1, "b": 2}})
+    second = canonical_request_hash({"changes": {"b": 2, "a": 1}, "expected_version": 2})
+
+    assert first == second
+    assert len(first) == 64
+
+
+@pytest.mark.parametrize("value", [True, False, 1.0, "1", 0, -1, None])
+def test_expected_version_validator_rejects_non_positive_or_non_integer(value: object) -> None:
+    """验证 Approval expected_version 严格拒绝 bool、非整数和非正数。"""
+    from app.approval.service import validate_expected_version
+
+    with pytest.raises(ApprovalError) as error:
+        validate_expected_version(value)
+    assert error.value.code == ApprovalErrorCode.INVALID_REQUEST.value
+
+
+def test_expected_version_validator_accepts_positive_integer() -> None:
+    """验证正整数 expected_version 可被应用层接受。"""
+    from app.approval.service import validate_expected_version
+
+    assert validate_expected_version(7) == 7
+
+
+def test_postgres_approval_cas_allows_only_matching_version() -> None:
+    """验证数据库 CAS 对相同旧版本只允许一次更新并原子递增。"""
+    engine = create_db_engine(get_settings())
+    factory = create_session_factory(engine)
+    approval_id = uuid4()
+
+    async def run() -> None:
+        """使用独立 Session 写入、竞争 CAS 并清理申请。"""
+        try:
+            async with factory() as session:
+                session.add(
+                    ApprovalApplication(
+                        id=approval_id,
+                        business_type=BusinessType.MASTER_DATA_CHANGE,
+                        business_id=f"cas-{approval_id}",
+                        applicant_id="cas-applicant",
+                    )
+                )
+                await session.commit()
+            async with factory() as session:
+                async with session.begin():
+                    version = await ApprovalRepository(session).update_application_if_version(
+                        approval_id,
+                        1,
+                        {"status": ApprovalStatus.IN_APPROVAL},
+                    )
+                    assert version == 2
+            async with factory() as session:
+                async with session.begin():
+                    version = await ApprovalRepository(session).update_application_if_version(
+                        approval_id,
+                        1,
+                        {"status": ApprovalStatus.COMPLETED},
+                    )
+                    assert version is None
+            async with factory() as session:
+                result = await session.execute(
+                    select(ApprovalApplication).where(ApprovalApplication.id == approval_id)
+                )
+                approval = result.scalar_one()
+                assert approval.status is ApprovalStatus.IN_APPROVAL
+                assert approval.version == 2
+        finally:
+            async with factory() as session:
+                await session.execute(
+                    delete(ApprovalApplication).where(ApprovalApplication.id == approval_id)
+                )
+                await session.commit()
+            await engine.dispose()
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize(
+    ("method", "path", "body", "service_dependency"),
+    [
+        (
+            "post",
+            "/api/v1/approvals/00000000-0000-0000-0000-000000000001/submit",
+            {"expected_version": 1},
+            get_approval_service,
+        ),
+        (
+            "post",
+            "/api/v1/approvals/00000000-0000-0000-0000-000000000001/approve",
+            {"expected_version": 1},
+            get_approval_service,
+        ),
+        (
+            "post",
+            "/api/v1/approvals/00000000-0000-0000-0000-000000000001/reject",
+            {"expected_version": 1, "target": "APPLICANT", "comment": "fix"},
+            get_approval_service,
+        ),
+        (
+            "post",
+            "/api/v1/approvals/00000000-0000-0000-0000-000000000001/withdraw",
+            {"expected_version": 1},
+            get_approval_service,
+        ),
+        (
+            "post",
+            "/api/v1/master-data/supplier/supplier_a/changes",
+            {"changes": {"currency": "USD"}, "reason": "test"},
+            get_master_data_service,
+        ),
+    ],
+)
+def test_write_api_without_idempotency_key_returns_stable_error(
+    method: str, path: str, body: dict[str, object], service_dependency
+) -> None:
+    """验证五类写 API 缺少幂等键时统一返回 422 Envelope 与 request_id。"""
+    settings = get_settings().model_copy()
+    app = create_app(settings)
+    context = AuthContext(
+        session_id=uuid4(),
+        user_id=uuid4(),
+        username="p1010-api",
+        display_name="P1-010 API",
+        roles=frozenset({UserRole.APPLICANT, UserRole.APPROVER, UserRole.DATA_ADMIN}),
+    )
+    app.dependency_overrides[get_current_auth] = lambda: context
+    service = (
+        ApprovalService(None)
+        if service_dependency is get_approval_service
+        else MasterDataService(None)
+    )
+    app.dependency_overrides[service_dependency] = lambda: service
+    with TestClient(RequestIdMiddleware(app, settings)) as client:
+        response = getattr(client, method)(
+            path,
+            json=body,
+            headers={"X-Request-ID": "p1-010-no-idempotency"},
+        )
+
+    assert response.status_code == 422
+    assert response.json()["error"]["code"] == "IDEMPOTENCY_KEY_REQUIRED"
+    assert response.json()["error"]["request_id"] == "p1-010-no-idempotency"
+
+
+@pytest.mark.parametrize(
+    ("path", "body"),
+    [
+        ("submit", None),
+        ("approve", {"comment": "ok"}),
+        ("reject", {"target": "APPLICANT", "comment": "fix"}),
+        ("withdraw", {"comment": "stop"}),
+    ],
+)
+def test_approval_write_missing_expected_version_returns_app_error(
+    path: str, body: dict[str, object] | None
+) -> None:
+    """验证 Approval 写 API 缺少 expected_version 时返回稳定应用错误。"""
+    settings = get_settings().model_copy()
+    app = create_app(settings)
+    context = AuthContext(
+        session_id=uuid4(),
+        user_id=uuid4(),
+        username="p1010-api",
+        display_name="P1-010 API",
+        roles=frozenset({UserRole.APPLICANT, UserRole.APPROVER, UserRole.DATA_ADMIN}),
+    )
+    app.dependency_overrides[get_current_auth] = lambda: context
+    app.dependency_overrides[get_approval_service] = lambda: ApprovalService(None)
+    with TestClient(RequestIdMiddleware(app, settings)) as client:
+        response = client.post(
+            f"/api/v1/approvals/00000000-0000-0000-0000-000000000001/{path}",
+            json=body,
+            headers={"Idempotency-Key": "expected-version-key"},
+        )
+
+    assert response.status_code == 422
+    assert response.json()["error"]["code"] == "APPROVAL_INVALID_REQUEST"
+
+
+async def _seed_approval_for_concurrency(factory, workflow_code: str):
+    """创建单节点审批流程和可由 APPROVER 完成的审批中申请。"""
+    applicant_id, approval_id, change_id = uuid4(), uuid4(), uuid4()
+    task_id = str(uuid4())
+    entity_key = f"p1-010-{uuid4().hex}"
+    spec = WorkflowDefinitionSpec(
+        code=workflow_code,
+        version=1,
+        nodes=(WorkflowNodeDefinition("final_review", UserRole.APPROVER),),
+    )
+    async with factory() as session:
+        session.add(
+            WorkflowDefinition(
+                code=workflow_code,
+                version=1,
+                definition_json={
+                    "code": workflow_code,
+                    "version": 1,
+                    "nodes": [{"key": "final_review", "role": "APPROVER"}],
+                },
+                active=False,
+            )
+        )
+        await session.flush()
+        session.add_all(
+            [
+                MasterDataEntity(
+                    entity_type="supplier", entity_key=entity_key, data_json={"name": "before"}
+                ),
+                ApprovalApplication(
+                    id=approval_id,
+                    business_type=BusinessType.MASTER_DATA_CHANGE,
+                    business_id=str(change_id),
+                    applicant_id=str(applicant_id),
+                    status=ApprovalStatus.IN_APPROVAL,
+                    workflow_code=workflow_code,
+                    workflow_version=1,
+                    workflow_instance_id=str(uuid4()),
+                    current_task_id=task_id,
+                    current_node_code="final_review",
+                    submitted_at=datetime.now(UTC),
+                ),
+                MasterDataChange(
+                    id=change_id,
+                    approval_id=approval_id,
+                    entity_type="supplier",
+                    entity_key=entity_key,
+                    before_data={"name": "before"},
+                    base_entity_version=1,
+                    form_data={"name": "after"},
+                    change_items=[{"field": "name", "operation": "UPDATE"}],
+                ),
+                ApprovalRecord(
+                    approval_id=approval_id,
+                    operator_id=str(applicant_id),
+                    action=ApprovalAction.SUBMIT,
+                    from_status=ApprovalStatus.DRAFT,
+                    to_status=ApprovalStatus.IN_APPROVAL,
+                    target_task_id=task_id,
+                    target_node_code="final_review",
+                ),
+            ]
+        )
+        await session.commit()
+    reviewer = AuthContext(
+        session_id=uuid4(),
+        user_id=uuid4(),
+        username="p1-010-reviewer",
+        display_name="P1-010 Reviewer",
+        roles=frozenset({UserRole.APPROVER}),
+    )
+    return approval_id, reviewer, entity_key, change_id, spec
+
+
+def test_postgres_concurrent_same_key_approval_replays_one_transition() -> None:
+    """验证两个独立 Session 对同键同请求只执行一次审批迁移。"""
+    engine = create_db_engine(get_settings())
+    factory = create_session_factory(engine)
+    approval_id = None
+    workflow_code = f"p1_010_same_{uuid4().hex}"
+    key = f"same-{uuid4()}"
+
+    async def run() -> None:
+        """并发执行 approve 并检查唯一历史、审计和幂等结果。"""
+        nonlocal approval_id
+        try:
+            (
+                approval_id,
+                reviewer,
+                entity_key,
+                change_id,
+                _spec,
+            ) = await _seed_approval_for_concurrency(factory, workflow_code)
+
+            async def invoke(comment: str):
+                """在独立 Session 使用等价规范化意见执行同键 approve。"""
+                async with factory() as session:
+                    return await ApprovalService(session).approve(
+                        approval_id,
+                        reviewer,
+                        expected_version=1,
+                        comment=comment,
+                        idempotency_key=key,
+                    )
+
+            first, second = await asyncio.gather(invoke("  同意  "), invoke("同意"))
+            assert first == second
+            assert first.version == 2
+            async with factory() as session:
+                with pytest.raises(IdempotencyError) as conflict:
+                    await ApprovalService(session).approve(
+                        approval_id,
+                        reviewer,
+                        expected_version=1,
+                        comment="不同意见",
+                        idempotency_key=key,
+                    )
+            assert conflict.value.code == IdempotencyErrorCode.CONFLICT.value
+            async with factory() as session:
+                assert (
+                    await session.scalar(
+                        select(func.count())
+                        .select_from(ApprovalRecord)
+                        .where(
+                            ApprovalRecord.approval_id == approval_id,
+                            ApprovalRecord.action == ApprovalAction.APPROVE,
+                        )
+                    )
+                    == 1
+                )
+                audits = list(
+                    (
+                        await session.scalars(
+                            select(AuditLog).where(
+                                AuditLog.resource_id == str(approval_id),
+                                AuditLog.action == "APPROVAL_APPROVE",
+                            )
+                        )
+                    ).all()
+                )
+                assert len(audits) == 1
+                assert audits[0].metadata_json["from_version"] == 1
+                assert audits[0].metadata_json["to_version"] == 2
+                assert "comment" not in audits[0].metadata_json
+                assert set(audits[0].metadata_json) <= {
+                    "approval_id",
+                    "from_status",
+                    "to_status",
+                    "from_version",
+                    "to_version",
+                    "from_node_code",
+                    "target_node_code",
+                }
+                assert (
+                    await session.scalar(
+                        select(func.count())
+                        .select_from(IdempotencyRecord)
+                        .where(
+                            IdempotencyRecord.actor_id == str(reviewer.user_id),
+                            IdempotencyRecord.key == key,
+                            IdempotencyRecord.response_json.is_not(None),
+                        )
+                    )
+                    == 1
+                )
+        finally:
+            if approval_id is not None:
+                async with factory() as session:
+                    await session.execute(
+                        delete(ApprovalRecord).where(ApprovalRecord.approval_id == approval_id)
+                    )
+                    await session.execute(
+                        delete(AuditLog).where(AuditLog.resource_id == str(approval_id))
+                    )
+                    await session.execute(
+                        delete(IdempotencyRecord).where(IdempotencyRecord.key == key)
+                    )
+                    await session.execute(
+                        delete(MasterDataChange).where(MasterDataChange.approval_id == approval_id)
+                    )
+                    await session.execute(
+                        delete(ApprovalApplication).where(ApprovalApplication.id == approval_id)
+                    )
+                    await session.execute(
+                        delete(MasterDataEntity).where(MasterDataEntity.entity_key == entity_key)
+                    )
+                    await session.execute(
+                        delete(WorkflowDefinition).where(WorkflowDefinition.code == workflow_code)
+                    )
+                    await session.commit()
+            await engine.dispose()
+
+    asyncio.run(run())
+
+
+def test_postgres_concurrent_different_keys_same_version_has_one_winner() -> None:
+    """验证不同键并发写同一 expected version 只允许一个 CAS 成功。"""
+    engine = create_db_engine(get_settings())
+    factory = create_session_factory(engine)
+    approval_id = None
+    workflow_code = f"p1_010_cas_{uuid4().hex}"
+    keys = (f"cas-a-{uuid4()}", f"cas-b-{uuid4()}")
+
+    async def run() -> None:
+        """通过两个独立 AsyncSession 并发 approve 并核验版本冲突。"""
+        nonlocal approval_id
+        try:
+            (
+                approval_id,
+                reviewer,
+                entity_key,
+                _change_id,
+                _spec,
+            ) = await _seed_approval_for_concurrency(factory, workflow_code)
+
+            async def invoke(key: str):
+                """使用独立 Session 和不同幂等键竞争同一版本。"""
+                async with factory() as session:
+                    try:
+                        return await ApprovalService(session).approve(
+                            approval_id,
+                            reviewer,
+                            expected_version=1,
+                            idempotency_key=key,
+                        )
+                    except ApprovalError as error:
+                        return error
+
+            results = await asyncio.gather(*(invoke(key) for key in keys))
+            successes = [item for item in results if not isinstance(item, ApprovalError)]
+            conflicts = [item for item in results if isinstance(item, ApprovalError)]
+            assert len(successes) == len(conflicts) == 1
+            assert conflicts[0].code == ApprovalErrorCode.VERSION_CONFLICT.value
+            assert successes[0].version == 2
+            async with factory() as session:
+                application = await session.get(ApprovalApplication, approval_id)
+                assert application is not None and application.version == 2
+                assert (
+                    await session.scalar(
+                        select(func.count())
+                        .select_from(ApprovalRecord)
+                        .where(
+                            ApprovalRecord.approval_id == approval_id,
+                            ApprovalRecord.action == ApprovalAction.APPROVE,
+                        )
+                    )
+                    == 1
+                )
+                assert (
+                    await session.scalar(
+                        select(func.count())
+                        .select_from(AuditLog)
+                        .where(
+                            AuditLog.resource_id == str(approval_id),
+                            AuditLog.action == "APPROVAL_APPROVE",
+                        )
+                    )
+                    == 1
+                )
+                assert (
+                    await session.scalar(
+                        select(func.count())
+                        .select_from(IdempotencyRecord)
+                        .where(IdempotencyRecord.resource_id == str(approval_id))
+                    )
+                    == 1
+                )
+        finally:
+            if approval_id is not None:
+                async with factory() as session:
+                    await session.execute(
+                        delete(ApprovalRecord).where(ApprovalRecord.approval_id == approval_id)
+                    )
+                    await session.execute(
+                        delete(AuditLog).where(AuditLog.resource_id == str(approval_id))
+                    )
+                    await session.execute(
+                        delete(IdempotencyRecord).where(
+                            IdempotencyRecord.resource_id == str(approval_id)
+                        )
+                    )
+                    await session.execute(
+                        delete(MasterDataChange).where(MasterDataChange.approval_id == approval_id)
+                    )
+                    await session.execute(
+                        delete(ApprovalApplication).where(ApprovalApplication.id == approval_id)
+                    )
+                    await session.execute(
+                        delete(MasterDataEntity).where(MasterDataEntity.entity_key == entity_key)
+                    )
+                    await session.execute(
+                        delete(WorkflowDefinition).where(WorkflowDefinition.code == workflow_code)
+                    )
+                    await session.commit()
+            await engine.dispose()
+
+    asyncio.run(run())
+
+
+def test_postgres_concurrent_same_key_draft_create_returns_one_draft() -> None:
+    """验证同用户并发同键创建草稿只生成一个 ApprovalApplication。"""
+    engine = create_db_engine(get_settings())
+    factory = create_session_factory(engine)
+    entity_key = f"same-draft-{uuid4().hex}"
+    auth = AuthContext(
+        session_id=uuid4(),
+        user_id=uuid4(),
+        username="p1-010-applicant",
+        display_name="P1-010 Applicant",
+        roles=frozenset({UserRole.APPLICANT}),
+    )
+    key = f"draft-same-{uuid4()}"
+
+    async def run() -> None:
+        """用独立 Session 并发 CREATE 并确认只有一次记录和审计。"""
+        try:
+            async with factory() as session:
+                session.add(
+                    MasterDataEntity(
+                        entity_type="supplier",
+                        entity_key=entity_key,
+                        data_json={"currency": "CNY"},
+                    )
+                )
+                await session.commit()
+
+            async def invoke():
+                """以相同规范化请求和 key 创建主数据草稿。"""
+                async with factory() as session:
+                    return await MasterDataService(session).create_or_update_draft(
+                        "supplier",
+                        entity_key,
+                        ChangeDraftRequest(changes={"currency": "USD"}, reason="currency"),
+                        auth,
+                        key,
+                    )
+
+            first, second = await asyncio.gather(invoke(), invoke())
+            assert first == second
+            async with factory() as session:
+                assert (
+                    await session.scalar(
+                        select(func.count())
+                        .select_from(ApprovalApplication)
+                        .where(ApprovalApplication.id == first.approval_id)
+                    )
+                    == 1
+                )
+                assert (
+                    await session.scalar(
+                        select(func.count())
+                        .select_from(ApprovalRecord)
+                        .where(
+                            ApprovalRecord.approval_id == first.approval_id,
+                            ApprovalRecord.action == ApprovalAction.CREATE,
+                        )
+                    )
+                    == 1
+                )
+                assert (
+                    await session.scalar(
+                        select(func.count())
+                        .select_from(AuditLog)
+                        .where(
+                            AuditLog.resource_id == str(first.approval_id),
+                            AuditLog.action == "MASTER_DATA_DRAFT_CREATE",
+                        )
+                    )
+                    == 1
+                )
+                record = await session.scalar(
+                    select(IdempotencyRecord).where(
+                        IdempotencyRecord.actor_id == str(auth.user_id),
+                        IdempotencyRecord.key == key,
+                    )
+                )
+                assert record is not None and record.response_json is not None
+        finally:
+            async with factory() as session:
+                ids = list(
+                    (
+                        await session.scalars(
+                            select(ApprovalApplication.id).where(
+                                ApprovalApplication.applicant_id == str(auth.user_id)
+                            )
+                        )
+                    ).all()
+                )
+                if ids:
+                    await session.execute(
+                        delete(ApprovalRecord).where(ApprovalRecord.approval_id.in_(ids))
+                    )
+                    await session.execute(
+                        delete(AuditLog).where(
+                            AuditLog.resource_id.in_([str(item) for item in ids])
+                        )
+                    )
+                    await session.execute(
+                        delete(MasterDataChange).where(MasterDataChange.approval_id.in_(ids))
+                    )
+                    await session.execute(
+                        delete(ApprovalApplication).where(ApprovalApplication.id.in_(ids))
+                    )
+                await session.execute(delete(IdempotencyRecord).where(IdempotencyRecord.key == key))
+                await session.execute(
+                    delete(MasterDataEntity).where(MasterDataEntity.entity_key == entity_key)
+                )
+                await session.commit()
+            await engine.dispose()
+
+    asyncio.run(run())
+
+
+def test_postgres_stale_draft_baseline_rolls_back_save_and_audit() -> None:
+    """验证当前主数据版本变化后拒绝 SAVE 且不改动草稿或审计。"""
+    engine = create_db_engine(get_settings())
+    factory = create_session_factory(engine)
+    entity_key = f"stale-draft-{uuid4().hex}"
+    auth = AuthContext(
+        session_id=uuid4(),
+        user_id=uuid4(),
+        username="p1-010-applicant",
+        display_name="P1-010 Applicant",
+        roles=frozenset({UserRole.APPLICANT}),
+    )
+    create_key, save_key = f"stale-create-{uuid4()}", f"stale-save-{uuid4()}"
+    approval_id = None
+
+    async def run() -> None:
+        """创建草稿、推进实体版本并核验失败 SAVE 未产生副作用。"""
+        nonlocal approval_id
+        try:
+            async with factory() as session:
+                entity = MasterDataEntity(
+                    entity_type="supplier",
+                    entity_key=entity_key,
+                    data_json={"currency": "CNY"},
+                )
+                session.add(entity)
+                await session.commit()
+                entity_id = entity.id
+            async with factory() as session:
+                draft = await MasterDataService(session).create_or_update_draft(
+                    "supplier",
+                    entity_key,
+                    ChangeDraftRequest(changes={"currency": "USD"}, reason="initial"),
+                    auth,
+                    create_key,
+                )
+                approval_id = draft.approval_id
+            async with factory() as session:
+                entity = await session.get(MasterDataEntity, entity_id)
+                assert entity is not None
+                entity.version = 2
+                entity.data_json = {"currency": "EUR"}
+                await session.commit()
+            async with factory() as session:
+                with pytest.raises(MasterDataError) as error:
+                    await MasterDataService(session).create_or_update_draft(
+                        "supplier",
+                        entity_key,
+                        ChangeDraftRequest(
+                            draft_approval_id=approval_id,
+                            expected_version=1,
+                            changes={"currency": "GBP"},
+                            reason="stale edit",
+                        ),
+                        auth,
+                        save_key,
+                    )
+                assert error.value.code == MasterDataErrorCode.VERSION_CONFLICT.value
+            async with factory() as session:
+                approval = await session.get(ApprovalApplication, approval_id)
+                change = await session.scalar(
+                    select(MasterDataChange).where(MasterDataChange.approval_id == approval_id)
+                )
+                assert approval is not None and approval.version == 1
+                assert change is not None
+                assert change.form_data == {"currency": "USD"}
+                assert change.change_reason == "initial"
+                assert (
+                    await session.scalar(
+                        select(func.count())
+                        .select_from(ApprovalRecord)
+                        .where(
+                            ApprovalRecord.approval_id == approval_id,
+                            ApprovalRecord.action == ApprovalAction.SAVE,
+                        )
+                    )
+                    == 0
+                )
+                assert (
+                    await session.scalar(
+                        select(func.count())
+                        .select_from(AuditLog)
+                        .where(AuditLog.resource_id == str(approval_id))
+                    )
+                    == 1
+                )
+                assert (
+                    await session.scalar(
+                        select(func.count())
+                        .select_from(IdempotencyRecord)
+                        .where(IdempotencyRecord.key == save_key)
+                    )
+                    == 0
+                )
+        finally:
+            if approval_id is not None:
+                async with factory() as session:
+                    await session.execute(
+                        delete(ApprovalRecord).where(ApprovalRecord.approval_id == approval_id)
+                    )
+                    await session.execute(
+                        delete(AuditLog).where(AuditLog.resource_id == str(approval_id))
+                    )
+                    await session.execute(
+                        delete(IdempotencyRecord).where(
+                            IdempotencyRecord.key.in_([create_key, save_key])
+                        )
+                    )
+                    await session.execute(
+                        delete(MasterDataChange).where(MasterDataChange.approval_id == approval_id)
+                    )
+                    await session.execute(
+                        delete(ApprovalApplication).where(ApprovalApplication.id == approval_id)
+                    )
+                    await session.execute(
+                        delete(MasterDataEntity).where(MasterDataEntity.entity_key == entity_key)
+                    )
+                    await session.commit()
+            await engine.dispose()
+
+
+def test_audit_repository_has_no_production_mutation_api() -> None:
+    """验证生产审计 Repository 只提供 append，不暴露更新或删除方法。"""
+    assert not hasattr(AuditRepository, "update")
+    assert not hasattr(AuditRepository, "delete")
+
+
+def test_postgres_expired_idempotency_key_is_atomically_reclaimed() -> None:
+    """验证过期键通过唯一约束原子重领并发重放同一结果。"""
+    engine = create_db_engine(get_settings())
+    factory = create_session_factory(engine)
+    actor_id = str(uuid4())
+    key = f"expired-{uuid4()}"
+    request_hash = canonical_request_hash({"expected_version": 1})
+
+    async def run() -> None:
+        """并发重领过期记录并确认只有一个 claim 被执行。"""
+        try:
+            async with factory() as session:
+                session.add(
+                    IdempotencyRecord(
+                        actor_id=actor_id,
+                        key=key,
+                        action="APPROVAL_SUBMIT",
+                        resource_type="approval",
+                        resource_id=str(uuid4()),
+                        request_hash=request_hash,
+                        response_json={"value": 0},
+                        expires_at=datetime.now(UTC) - timedelta(seconds=1),
+                    )
+                )
+                await session.commit()
+
+            async def reclaim():
+                """在独立事务中原子 claim 或 replay 过期幂等键。"""
+                async with factory() as session:
+                    async with session.begin():
+                        service = IdempotencyService(session)
+                        claim = await service.claim(
+                            actor_id=actor_id,
+                            key=key,
+                            action="APPROVAL_SUBMIT",
+                            resource_type="approval",
+                            resource_id="approval-resource",
+                            request_hash=request_hash,
+                        )
+                        if claim.is_new:
+                            response = _VersionResponse(value=3)
+                            await service.complete(claim, response)
+                            return response
+                        return service.replay(claim, _VersionResponse)
+
+            first, second = await asyncio.gather(reclaim(), reclaim())
+            assert first == second == _VersionResponse(value=3)
+            async with factory() as session:
+                record = await session.scalar(
+                    select(IdempotencyRecord).where(
+                        IdempotencyRecord.actor_id == actor_id,
+                        IdempotencyRecord.key == key,
+                    )
+                )
+                assert record is not None
+                assert record.response_json == {"value": 3}
+                assert record.expires_at > datetime.now(UTC)
+        finally:
+            async with factory() as session:
+                await session.execute(
+                    delete(IdempotencyRecord).where(
+                        IdempotencyRecord.actor_id == actor_id,
+                        IdempotencyRecord.key == key,
+                    )
+                )
+                await session.commit()
+            await engine.dispose()
+
+
+def test_postgres_audit_failure_rolls_back_cas_history_and_idempotency() -> None:
+    """验证审计 flush 后失败会回滚 CAS、历史、审计和幂等 claim。"""
+    engine = create_db_engine(get_settings())
+    factory = create_session_factory(engine)
+    approval_id = None
+    workflow_code = f"p1_010_audit_fail_{uuid4().hex}"
+    key = f"audit-fail-{uuid4()}"
+
+    async def run() -> None:
+        """在成功 CAS 和历史写入后注入审计异常并检查全量回滚。"""
+        nonlocal approval_id
+        original_append = AuditRepository.append
+        try:
+            (
+                approval_id,
+                reviewer,
+                entity_key,
+                _change_id,
+                _spec,
+            ) = await _seed_approval_for_concurrency(factory, workflow_code)
+
+            async def append_then_fail(repository, **kwargs):
+                """先 flush 审计行再注入异常，触发整个业务事务回滚。"""
+                await original_append(repository, **kwargs)
+                raise RuntimeError("injected audit failure")
+
+            AuditRepository.append = append_then_fail
+            async with factory() as session:
+                with pytest.raises(RuntimeError, match="injected audit failure"):
+                    await ApprovalService(session).approve(
+                        approval_id,
+                        reviewer,
+                        expected_version=1,
+                        idempotency_key=key,
+                    )
+            AuditRepository.append = original_append
+
+            async with factory() as session:
+                application = await session.get(ApprovalApplication, approval_id)
+                assert application is not None
+                assert application.status is ApprovalStatus.IN_APPROVAL
+                assert application.version == 1
+                assert (
+                    await session.scalar(
+                        select(func.count())
+                        .select_from(ApprovalRecord)
+                        .where(
+                            ApprovalRecord.approval_id == approval_id,
+                            ApprovalRecord.action == ApprovalAction.APPROVE,
+                        )
+                    )
+                    == 0
+                )
+                assert (
+                    await session.scalar(
+                        select(func.count())
+                        .select_from(AuditLog)
+                        .where(AuditLog.resource_id == str(approval_id))
+                    )
+                    == 0
+                )
+                assert (
+                    await session.scalar(
+                        select(func.count())
+                        .select_from(IdempotencyRecord)
+                        .where(
+                            IdempotencyRecord.actor_id == str(reviewer.user_id),
+                            IdempotencyRecord.key == key,
+                        )
+                    )
+                    == 0
+                )
+            async with factory() as session:
+                retried = await ApprovalService(session).approve(
+                    approval_id,
+                    reviewer,
+                    expected_version=1,
+                    idempotency_key=key,
+                )
+                assert retried.version == 2
+            async with factory() as session:
+                assert (
+                    await session.scalar(
+                        select(func.count())
+                        .select_from(AuditLog)
+                        .where(
+                            AuditLog.resource_id == str(approval_id),
+                            AuditLog.action == "APPROVAL_APPROVE",
+                        )
+                    )
+                    == 1
+                )
+        finally:
+            AuditRepository.append = original_append
+            if approval_id is not None:
+                async with factory() as session:
+                    await session.execute(
+                        delete(ApprovalRecord).where(ApprovalRecord.approval_id == approval_id)
+                    )
+                    await session.execute(
+                        delete(AuditLog).where(AuditLog.resource_id == str(approval_id))
+                    )
+                    await session.execute(
+                        delete(IdempotencyRecord).where(IdempotencyRecord.key == key)
+                    )
+                    await session.execute(
+                        delete(MasterDataChange).where(MasterDataChange.approval_id == approval_id)
+                    )
+                    await session.execute(
+                        delete(ApprovalApplication).where(ApprovalApplication.id == approval_id)
+                    )
+                    await session.execute(
+                        delete(MasterDataEntity).where(MasterDataEntity.entity_key == entity_key)
+                    )
+                    await session.execute(
+                        delete(WorkflowDefinition).where(WorkflowDefinition.code == workflow_code)
+                    )
+                    await session.commit()
+            await engine.dispose()
+
+    asyncio.run(run())
+
+
+def test_postgres_committed_null_idempotency_response_is_integrity_error() -> None:
+    """验证已提交但无响应的幂等记录报完整性错误且不重执行。"""
+    engine = create_db_engine(get_settings())
+    factory = create_session_factory(engine)
+    actor_id = str(uuid4())
+    key = f"null-response-{uuid4()}"
+    request_hash = canonical_request_hash({"expected_version": 1})
+
+    async def run() -> None:
+        """写入 SQL NULL 响应并确认 claim 不会重新执行业务。"""
+        try:
+            async with factory() as session:
+                session.add(
+                    IdempotencyRecord(
+                        actor_id=actor_id,
+                        key=key,
+                        action="APPROVAL_SUBMIT",
+                        resource_type="approval",
+                        resource_id="null-response-resource",
+                        request_hash=request_hash,
+                        response_json=None,
+                        expires_at=datetime.now(UTC) + timedelta(hours=1),
+                    )
+                )
+                await session.commit()
+            async with factory() as session:
+                async with session.begin():
+                    with pytest.raises(IdempotencyError) as error:
+                        await IdempotencyService(session).claim(
+                            actor_id=actor_id,
+                            key=key,
+                            action="APPROVAL_SUBMIT",
+                            resource_type="approval",
+                            resource_id="null-response-resource",
+                            request_hash=request_hash,
+                        )
+                assert error.value.code == IdempotencyErrorCode.DATA_INTEGRITY_ERROR.value
+            async with factory() as session:
+                record = await session.scalar(
+                    select(IdempotencyRecord).where(
+                        IdempotencyRecord.actor_id == actor_id,
+                        IdempotencyRecord.key == key,
+                    )
+                )
+                assert record is not None and record.response_json is None
+        finally:
+            async with factory() as session:
+                await session.execute(
+                    delete(IdempotencyRecord).where(
+                        IdempotencyRecord.actor_id == actor_id,
+                        IdempotencyRecord.key == key,
+                    )
+                )
+                await session.commit()
+            await engine.dispose()
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("key", ["   ", "x" * 201])
+def test_approval_write_invalid_idempotency_key_returns_app_error(key: str) -> None:
+    """验证空白和超长幂等键由应用层映射为稳定 ErrorEnvelope。"""
+    settings = get_settings().model_copy()
+    app = create_app(settings)
+    context = AuthContext(
+        session_id=uuid4(),
+        user_id=uuid4(),
+        username="p1010-api",
+        display_name="P1-010 API",
+        roles=frozenset({UserRole.APPLICANT}),
+    )
+    app.dependency_overrides[get_current_auth] = lambda: context
+    app.dependency_overrides[get_approval_service] = lambda: ApprovalService(None)
+    with TestClient(RequestIdMiddleware(app, settings)) as client:
+        response = client.post(
+            f"/api/v1/approvals/{uuid4()}/submit",
+            json={"expected_version": 1},
+            headers={"Idempotency-Key": key, "X-Request-ID": "invalid-idempotency"},
+        )
+    assert response.status_code == 422
+    assert response.json()["error"]["code"] == "IDEMPOTENCY_KEY_INVALID"
+    assert response.json()["error"]["request_id"] == "invalid-idempotency"
+
+
+@pytest.mark.parametrize("value", [True, False, 1.0, "1", 0, -1])
+def test_approval_write_invalid_expected_version_returns_app_error(value: object) -> None:
+    """验证 bool、非整数和非正 expected_version 不被 FastAPI 提前截断。"""
+    settings = get_settings().model_copy()
+    app = create_app(settings)
+    context = AuthContext(
+        session_id=uuid4(),
+        user_id=uuid4(),
+        username="p1010-api",
+        display_name="P1-010 API",
+        roles=frozenset({UserRole.APPLICANT}),
+    )
+    app.dependency_overrides[get_current_auth] = lambda: context
+    app.dependency_overrides[get_approval_service] = lambda: ApprovalService(None)
+    with TestClient(RequestIdMiddleware(app, settings)) as client:
+        response = client.post(
+            f"/api/v1/approvals/{uuid4()}/submit",
+            json={"expected_version": value},
+            headers={"Idempotency-Key": "invalid-version", "X-Request-ID": "invalid-version"},
+        )
+    assert response.status_code == 422
+    assert response.json()["error"]["code"] == "APPROVAL_INVALID_REQUEST"
+    assert response.json()["error"]["request_id"] == "invalid-version"
+
+
+@pytest.mark.parametrize("value", [True, False, 1.0, "1", 0, -1, None])
+def test_draft_update_invalid_expected_version_returns_master_data_error(value: object) -> None:
+    """验证草稿更新非法 expected_version 返回主数据稳定应用错误。"""
+    settings = get_settings().model_copy()
+    app = create_app(settings)
+    context = AuthContext(
+        session_id=uuid4(),
+        user_id=uuid4(),
+        username="p1010-api",
+        display_name="P1-010 API",
+        roles=frozenset({UserRole.APPLICANT}),
+    )
+    app.dependency_overrides[get_current_auth] = lambda: context
+    app.dependency_overrides[get_master_data_service] = lambda: MasterDataService(None)
+    with TestClient(RequestIdMiddleware(app, settings)) as client:
+        response = client.post(
+            "/api/v1/master-data/supplier/supplier_a/changes",
+            json={
+                "draft_approval_id": str(uuid4()),
+                "expected_version": value,
+                "changes": {"currency": "USD"},
+                "reason": "test",
+            },
+            headers={"Idempotency-Key": "invalid-draft-version"},
+        )
+    assert response.status_code == 422
+    assert response.json()["error"]["code"] == "MASTER_DATA_INVALID_CHANGE"
+
+
+class _VersionResponse(BaseModel):
+    """为幂等重放测试提供最小响应模型。"""
+
+    value: int

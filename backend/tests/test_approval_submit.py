@@ -2,7 +2,7 @@
 
 import asyncio
 from datetime import UTC, datetime
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import pytest
 from fastapi.testclient import TestClient
@@ -24,6 +24,7 @@ from app.models.approval import ApprovalApplication, ApprovalRecord
 from app.models.master_data import MasterDataChange, MasterDataEntity
 from app.models.workflow import WorkflowDefinition
 from app.workflow.repository import WorkflowDefinitionRepository
+from tests.p1_010_helpers import approval_write
 
 
 def test_submit_api_requires_bearer_and_returns_request_id_error_envelope() -> None:
@@ -31,7 +32,9 @@ def test_submit_api_requires_bearer_and_returns_request_id_error_envelope() -> N
     settings = Settings(_env_file=None)
     api = create_app(settings)
     api.dependency_overrides[get_auth_service] = lambda: object()
-    client = TestClient(RequestIdMiddleware(api, settings))
+    client = TestClient(
+        RequestIdMiddleware(api, settings), headers={"Idempotency-Key": "submit-api-test"}
+    )
     response = client.post(
         f"/api/v1/approvals/{uuid4()}/submit", headers={"X-Request-ID": "submit-auth"}
     )
@@ -124,7 +127,7 @@ def test_submit_api_role_guard_and_error_mapping(
             """初始化服务调用计数，供权限绕过断言使用。"""
             self.calls = 0
 
-        async def submit(self, approval_id, current_auth):
+        async def submit(self, approval_id, current_auth, expected_version, idempotency_key):
             """验证服务只收到可信身份，再返回稳定审批错误。"""
             self.calls += 1
             assert current_auth is auth_context
@@ -135,11 +138,13 @@ def test_submit_api_role_guard_and_error_mapping(
     service_stub = FakeApprovalService()
     api.dependency_overrides[get_auth_service] = lambda: FakeAuthService()
     api.dependency_overrides[get_approval_service] = lambda: service_stub
-    client = TestClient(RequestIdMiddleware(api, settings))
+    client = TestClient(
+        RequestIdMiddleware(api, settings), headers={"Idempotency-Key": "api-contract-test"}
+    )
     response = client.post(
         f"/api/v1/approvals/{uuid4()}/submit",
         headers={"Authorization": "Bearer test-token", "X-Request-ID": "submit-role"},
-        json={"workflow_code": "attacker", "workflow_instance_id": "injected"},
+        json={"expected_version": 1},
     )
     assert response.status_code == expected_status
     assert response.json()["error"]["code"] == expected_code
@@ -170,6 +175,7 @@ def test_submit_api_owner_success_ignores_client_workflow_values() -> None:
         current_node_code="manager_review",
         current_node_role=UserRole.APPROVER,
         submitted_at=datetime.now(UTC),
+        version=2,
     )
 
     class FakeAuthService:
@@ -183,21 +189,25 @@ def test_submit_api_owner_success_ignores_client_workflow_values() -> None:
     class FakeApprovalService:
         """返回服务端构建的提交结果并检查身份来源。"""
 
-        async def submit(self, approval_id, current_auth):
+        async def submit(self, approval_id, current_auth, expected_version, idempotency_key):
             """忽略客户端 body，仅按路径 ID 和可信身份调用。"""
             assert current_auth is auth_context
             assert approval_id == result.approval_id
+            assert expected_version == 1
+            assert idempotency_key == "api-contract-test"
             return result
 
     settings = Settings(_env_file=None)
     api = create_app(settings)
     api.dependency_overrides[get_auth_service] = lambda: FakeAuthService()
     api.dependency_overrides[get_approval_service] = lambda: FakeApprovalService()
-    client = TestClient(RequestIdMiddleware(api, settings))
+    client = TestClient(
+        RequestIdMiddleware(api, settings), headers={"Idempotency-Key": "api-contract-test"}
+    )
     response = client.post(
         f"/api/v1/approvals/{result.approval_id}/submit",
         headers={"Authorization": "Bearer test-token"},
-        json={"workflow_code": "attacker", "current_task_id": "attacker"},
+        json={"expected_version": 1},
     )
     assert response.status_code == 200
     assert response.json()["workflow_code"] == "supplier_change"
@@ -218,6 +228,7 @@ def test_postgres_submit_binding_resubmit_and_rollback(monkeypatch) -> None:
     entity_key = f"submit-{uuid4().hex}"
     workflow_code = "supplier_change"
     workflow_version = 900000 + int(uuid4().hex[:6], 16)
+    previously_active_workflow_ids: list[UUID] = []
     spec = WorkflowDefinitionSpec(
         code=workflow_code,
         version=workflow_version,
@@ -228,6 +239,26 @@ def test_postgres_submit_binding_resubmit_and_rollback(monkeypatch) -> None:
         """准备真实 PostgreSQL 数据并验证多个提交事务分支。"""
         try:
             async with factory() as session:
+                previously_active_workflow_ids.extend(
+                    list(
+                        (
+                            await session.scalars(
+                                select(WorkflowDefinition.id).where(
+                                    WorkflowDefinition.code == workflow_code,
+                                    WorkflowDefinition.active.is_(True),
+                                )
+                            )
+                        ).all()
+                    )
+                )
+                await session.execute(
+                    update(WorkflowDefinition)
+                    .where(
+                        WorkflowDefinition.code == workflow_code,
+                        WorkflowDefinition.active.is_(True),
+                    )
+                    .values(active=False)
+                )
                 session.add(
                     MasterDataEntity(
                         entity_type="supplier",
@@ -270,7 +301,7 @@ def test_postgres_submit_binding_resubmit_and_rollback(monkeypatch) -> None:
 
             async with factory() as session:
                 with pytest.raises(ApprovalError) as workflow_error:
-                    await ApprovalService(session).submit(approval_id, auth)
+                    await approval_write(ApprovalService(session), "submit", approval_id, auth)
                 assert workflow_error.value.code == ApprovalErrorCode.WORKFLOW_NOT_CONFIGURED.value
             async with factory() as session:
                 session.add(
@@ -297,7 +328,7 @@ def test_postgres_submit_binding_resubmit_and_rollback(monkeypatch) -> None:
             monkeypatch.setattr(ApprovalRepository, "save_transition", save_then_fail)
             async with factory() as session:
                 with pytest.raises(RuntimeError, match="injected initial submit failure"):
-                    await ApprovalService(session).submit(approval_id, auth)
+                    await approval_write(ApprovalService(session), "submit", approval_id, auth)
             async with factory() as session:
                 approval = await session.get(ApprovalApplication, approval_id)
                 assert approval is not None
@@ -327,11 +358,13 @@ def test_postgres_submit_binding_resubmit_and_rollback(monkeypatch) -> None:
             )
             async with factory() as session:
                 with pytest.raises(ApprovalError) as missing_error:
-                    await ApprovalService(session).submit(uuid4(), auth)
+                    await approval_write(ApprovalService(session), "submit", uuid4(), auth)
                 assert missing_error.value.code == ApprovalErrorCode.NOT_FOUND.value
             async with factory() as session:
                 with pytest.raises(ApprovalError) as owner_error:
-                    await ApprovalService(session).submit(approval_id, other_applicant)
+                    await approval_write(
+                        ApprovalService(session), "submit", approval_id, other_applicant
+                    )
                 assert owner_error.value.code == ApprovalErrorCode.FORBIDDEN.value
             async with factory() as session:
                 assert (
@@ -345,7 +378,9 @@ def test_postgres_submit_binding_resubmit_and_rollback(monkeypatch) -> None:
                 )
 
             async with factory() as session:
-                response = await ApprovalService(session).submit(approval_id, auth)
+                response = await approval_write(
+                    ApprovalService(session), "submit", approval_id, auth
+                )
             assert response.status is ApprovalStatus.IN_APPROVAL
             assert response.workflow_code == workflow_code
             assert response.workflow_version == workflow_version
@@ -362,7 +397,7 @@ def test_postgres_submit_binding_resubmit_and_rollback(monkeypatch) -> None:
                 assert approval.current_node_name is None
                 assert approval.submitted_at is not None
                 assert approval.submitted_at.tzinfo is not None
-                assert approval.version == 1
+                assert approval.version == 2
                 records = list(
                     (
                         await session.scalars(
@@ -386,7 +421,7 @@ def test_postgres_submit_binding_resubmit_and_rollback(monkeypatch) -> None:
                 first_runtime = (approval.workflow_instance_id, approval.current_task_id)
             async with factory() as session:
                 with pytest.raises(ApprovalError) as duplicate_error:
-                    await ApprovalService(session).submit(approval_id, auth)
+                    await approval_write(ApprovalService(session), "submit", approval_id, auth)
                 assert duplicate_error.value.code == ApprovalErrorCode.INVALID_TRANSITION.value
 
             async with factory() as session:
@@ -450,7 +485,7 @@ def test_postgres_submit_binding_resubmit_and_rollback(monkeypatch) -> None:
             )
             async with factory() as session:
                 with pytest.raises(ApprovalError) as missing_bound_error:
-                    await ApprovalService(session).submit(approval_id, auth)
+                    await approval_write(ApprovalService(session), "submit", approval_id, auth)
                 assert (
                     missing_bound_error.value.code == ApprovalErrorCode.DATA_INTEGRITY_ERROR.value
                 )
@@ -461,14 +496,16 @@ def test_postgres_submit_binding_resubmit_and_rollback(monkeypatch) -> None:
             )
 
             async with factory() as session:
-                resubmitted = await ApprovalService(session).submit(approval_id, auth)
+                resubmitted = await approval_write(
+                    ApprovalService(session), "submit", approval_id, auth
+                )
             assert resubmitted.workflow_version == workflow_version
             assert resubmitted.current_node_code == "manager_review"
             async with factory() as session:
                 approval = await session.get(ApprovalApplication, approval_id)
                 assert approval is not None
                 assert (approval.workflow_instance_id, approval.current_task_id) != first_runtime
-                assert approval.version == 1
+                assert approval.version == 3
                 assert approval.workflow_version == workflow_version
                 assert (
                     await session.scalar(
@@ -531,7 +568,7 @@ def test_postgres_submit_binding_resubmit_and_rollback(monkeypatch) -> None:
             monkeypatch.setattr(ApprovalRepository, "save_transition", save_then_fail)
             async with factory() as session:
                 with pytest.raises(RuntimeError, match="injected submit failure"):
-                    await ApprovalService(session).submit(approval_id, auth)
+                    await approval_write(ApprovalService(session), "submit", approval_id, auth)
 
             async with factory() as session:
                 approval = await session.get(ApprovalApplication, approval_id)
@@ -591,6 +628,12 @@ def test_postgres_submit_binding_resubmit_and_rollback(monkeypatch) -> None:
                         WorkflowDefinition.version.in_([workflow_version, workflow_version + 1]),
                     )
                 )
+                if previously_active_workflow_ids:
+                    await session.execute(
+                        update(WorkflowDefinition)
+                        .where(WorkflowDefinition.id.in_(previously_active_workflow_ids))
+                        .values(active=True)
+                    )
                 await session.commit()
             await engine.dispose()
 
@@ -693,8 +736,10 @@ def test_postgres_submit_rejects_broken_business_and_workflow_links() -> None:
     mismatch_change_id = uuid4()
     unsupported_approval_id = uuid4()
     unsupported_change_id = uuid4()
+    unsupported_entity_key = f"customer-{uuid4().hex}"
     corrupt_approval_id = uuid4()
     corrupt_change_id = uuid4()
+    corrupt_entity_key = f"corrupt-{uuid4().hex}"
     corrupt_workflow_code = f"corrupt_{uuid4().hex}"
     approval_ids = (
         missing_change_approval_id,
@@ -761,11 +806,17 @@ def test_postgres_submit_rejects_broken_business_and_workflow_links() -> None:
                             id=unsupported_change_id,
                             approval_id=unsupported_approval_id,
                             entity_type="customer",
-                            entity_key=f"customer-{uuid4().hex}",
+                            entity_key=unsupported_entity_key,
                             before_data={"name": "before"},
                             base_entity_version=1,
                             form_data={"name": "after"},
                             change_items=[{"field": "name", "operation": "UPDATE"}],
+                        ),
+                        MasterDataEntity(
+                            entity_type="customer",
+                            entity_key=unsupported_entity_key,
+                            data_json={"name": "current"},
+                            version=1,
                         ),
                         ApprovalApplication(
                             id=corrupt_approval_id,
@@ -780,11 +831,17 @@ def test_postgres_submit_rejects_broken_business_and_workflow_links() -> None:
                             id=corrupt_change_id,
                             approval_id=corrupt_approval_id,
                             entity_type="supplier",
-                            entity_key=f"corrupt-{uuid4().hex}",
+                            entity_key=corrupt_entity_key,
                             before_data={"name": "before"},
                             base_entity_version=1,
                             form_data={"name": "after"},
                             change_items=[{"field": "name", "operation": "UPDATE"}],
+                        ),
+                        MasterDataEntity(
+                            entity_type="supplier",
+                            entity_key=corrupt_entity_key,
+                            data_json={"name": "current"},
+                            version=1,
                         ),
                     ]
                 )
@@ -799,7 +856,7 @@ def test_postgres_submit_rejects_broken_business_and_workflow_links() -> None:
             for approval_id, expected_code in cases:
                 async with factory() as session:
                     with pytest.raises(ApprovalError) as error:
-                        await ApprovalService(session).submit(approval_id, auth)
+                        await approval_write(ApprovalService(session), "submit", approval_id, auth)
                     assert error.value.code == expected_code.value
 
             async with factory() as session:
@@ -840,6 +897,13 @@ def test_postgres_submit_rejects_broken_business_and_workflow_links() -> None:
                 )
                 await session.execute(
                     delete(MasterDataChange).where(MasterDataChange.id.in_(change_ids))
+                )
+                await session.execute(
+                    delete(MasterDataEntity).where(
+                        MasterDataEntity.entity_key.in_(
+                            [unsupported_entity_key, corrupt_entity_key]
+                        )
+                    )
                 )
                 await session.execute(
                     delete(ApprovalApplication).where(ApprovalApplication.id.in_(approval_ids))

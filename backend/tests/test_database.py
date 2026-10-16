@@ -64,4 +64,6 @@ def test_engine_and_factory_are_async_and_sessions_are_independent() -> None:
         "user_roles",
         "auth_sessions",
         "workflow_definitions",
+        "idempotency_records",
+        "audit_logs",
     }
