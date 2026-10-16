@@ -289,6 +289,48 @@ class ApprovalService:
             )
             return _action_response(approval, decision.action, target_node)
 
+    async def withdraw(
+        self, approval_id: UUID, auth_context: AuthContext, comment: object = None
+    ) -> ApprovalActionResponse:
+        """在一个事务中撤回首节点申请并追加 WITHDRAW 历史，不修改主数据。"""
+        normalized_comment = _normalize_withdraw_comment(comment)
+        async with self._session.begin():
+            approval, spec, current_node, _assignment = await self._load_action_context(
+                approval_id, ApprovalAction.WITHDRAW, auth_context
+            )
+            context = TransitionContext(
+                actor_id=str(auth_context.user_id),
+                applicant_id=approval.applicant_id,
+                is_first_approval_node=spec.is_first_node(current_node.key),
+            )
+            decision = self._decide(approval.status, ApprovalAction.WITHDRAW, context)
+            old_task_id = approval.current_task_id
+            old_node_code = approval.current_node_code
+            old_node_name = approval.current_node_name
+            approval.status = decision.to_status
+            approval.current_task_id = None
+            approval.current_node_code = None
+            approval.current_node_name = None
+            approval.completed_at = None
+            await self._repository.save_transition(
+                ApprovalRecord(
+                    approval_id=approval.id,
+                    operator_id=str(auth_context.user_id),
+                    action=decision.action,
+                    comment=normalized_comment,
+                    from_status=decision.from_status,
+                    to_status=decision.to_status,
+                    from_task_id=old_task_id,
+                    from_node_code=old_node_code,
+                    from_node_name=old_node_name,
+                    target_task_id=None,
+                    target_node_code=None,
+                    target_node_name=None,
+                    target_operator_id=approval.applicant_id,
+                )
+            )
+            return _action_response(approval, decision.action, None)
+
     async def _load_action_context(
         self,
         approval_id: UUID,
@@ -325,6 +367,7 @@ class ApprovalService:
                     actor_id=actor_id,
                     applicant_id=approval.applicant_id,
                     current_assignee_ids=frozenset({actor_id}),
+                    is_first_approval_node=action is ApprovalAction.WITHDRAW,
                     reject_target_type=(
                         RejectTargetType.APPLICANT if action is ApprovalAction.REJECT else None
                     ),
@@ -358,6 +401,10 @@ class ApprovalService:
             raise ApprovalError(ApprovalErrorCode.INVALID_TRANSITION) from error
         if error.code is ApprovalTransitionErrorCode.ACTOR_NOT_CURRENT_ASSIGNEE:
             raise ApprovalError(ApprovalErrorCode.FORBIDDEN) from error
+        if error.code is ApprovalTransitionErrorCode.ACTOR_NOT_APPLICANT:
+            raise ApprovalError(ApprovalErrorCode.FORBIDDEN) from error
+        if error.code is ApprovalTransitionErrorCode.WITHDRAW_NOT_FIRST_NODE:
+            raise ApprovalError(ApprovalErrorCode.WITHDRAW_NOT_ALLOWED) from error
         raise ApprovalError(ApprovalErrorCode.DATA_INTEGRITY_ERROR) from error
 
 
@@ -385,6 +432,18 @@ def _normalize_reject_request(target: object, comment: object) -> tuple[RejectTa
     except (ValueError, TypeError) as error:
         raise ApprovalError(ApprovalErrorCode.INVALID_REQUEST) from error
     return reject_target, normalized_comment
+
+
+def _normalize_withdraw_comment(comment: object) -> str | None:
+    """清理可选撤回意见，并拒绝非字符串或超过 2000 字符的内容。"""
+    if comment is None:
+        return None
+    if not isinstance(comment, str):
+        raise ApprovalError(ApprovalErrorCode.INVALID_REQUEST)
+    normalized = comment.strip()
+    if len(normalized) > 2000:
+        raise ApprovalError(ApprovalErrorCode.INVALID_REQUEST)
+    return normalized or None
 
 
 def _action_response(

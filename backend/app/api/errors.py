@@ -30,6 +30,7 @@ _APPROVAL_HTTP_STATUS = {
     ApprovalErrorCode.DATA_INTEGRITY_ERROR.value: 500,
     ApprovalErrorCode.INVALID_REQUEST.value: 422,
     ApprovalErrorCode.REJECT_TARGET_UNAVAILABLE.value: 409,
+    ApprovalErrorCode.WITHDRAW_NOT_ALLOWED.value: 409,
 }
 
 

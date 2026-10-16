@@ -15,6 +15,7 @@ class ApprovalErrorCode(StrEnum):
     DATA_INTEGRITY_ERROR = "APPROVAL_DATA_INTEGRITY_ERROR"
     INVALID_REQUEST = "APPROVAL_INVALID_REQUEST"
     REJECT_TARGET_UNAVAILABLE = "APPROVAL_REJECT_TARGET_UNAVAILABLE"
+    WITHDRAW_NOT_ALLOWED = "APPROVAL_WITHDRAW_NOT_ALLOWED"
 
 
 _MESSAGES = {
@@ -25,6 +26,7 @@ _MESSAGES = {
     ApprovalErrorCode.DATA_INTEGRITY_ERROR: "审批申请或绑定流程数据不完整",
     ApprovalErrorCode.INVALID_REQUEST: "审批操作请求无效",
     ApprovalErrorCode.REJECT_TARGET_UNAVAILABLE: "当前节点没有可退回的上一审批节点",
+    ApprovalErrorCode.WITHDRAW_NOT_ALLOWED: "当前审批节点不允许申请人撤回",
 }
 
 
