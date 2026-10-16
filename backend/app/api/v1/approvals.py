@@ -2,11 +2,14 @@
 
 from uuid import UUID
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, Query
 
-from app.api.deps import get_approval_service, require_any_role
+from app.api.deps import get_approval_service, get_current_auth, require_any_role
 from app.approval.schemas import (
     ApprovalActionResponse,
+    ApprovalDetailResponse,
+    ApprovalHistoryResponse,
+    ApprovalListResponse,
     ApproveRequest,
     RejectRequest,
     SubmitApprovalResponse,
@@ -14,9 +17,53 @@ from app.approval.schemas import (
 )
 from app.approval.service import ApprovalService
 from app.auth.context import AuthContext
+from app.domain.approval.enums import ApprovalStatus
 from app.domain.auth.enums import UserRole
 
 router = APIRouter(prefix="/api/v1/approvals", tags=["approvals"])
+
+
+@router.get("", response_model=ApprovalListResponse)
+async def list_my_approvals(
+    status: ApprovalStatus | None = None,
+    limit: int = Query(default=20, ge=1, le=100),
+    offset: int = Query(default=0, ge=0),
+    auth_context: AuthContext = Depends(get_current_auth),
+    service: ApprovalService = Depends(get_approval_service),
+) -> ApprovalListResponse:
+    """列出当前认证申请人发起的审批并应用有限 offset 分页。"""
+    return await service.list_my_approvals(auth_context, status=status, limit=limit, offset=offset)
+
+
+@router.get("/pending", response_model=ApprovalListResponse)
+async def list_pending_approvals(
+    limit: int = Query(default=20, ge=1, le=100),
+    offset: int = Query(default=0, ge=0),
+    auth_context: AuthContext = Depends(require_any_role(UserRole.APPROVER, UserRole.DATA_ADMIN)),
+    service: ApprovalService = Depends(get_approval_service),
+) -> ApprovalListResponse:
+    """列出当前 reviewer 有资格处理的待办审批。"""
+    return await service.list_pending_approvals(auth_context, limit=limit, offset=offset)
+
+
+@router.get("/{approval_id}/history", response_model=ApprovalHistoryResponse)
+async def get_approval_history(
+    approval_id: UUID,
+    auth_context: AuthContext = Depends(get_current_auth),
+    service: ApprovalService = Depends(get_approval_service),
+) -> ApprovalHistoryResponse:
+    """读取通过 Service 数据权限校验的审批动作历史。"""
+    return await service.get_history(approval_id, auth_context)
+
+
+@router.get("/{approval_id}", response_model=ApprovalDetailResponse)
+async def get_approval_detail(
+    approval_id: UUID,
+    auth_context: AuthContext = Depends(get_current_auth),
+    service: ApprovalService = Depends(get_approval_service),
+) -> ApprovalDetailResponse:
+    """读取通过 Service 数据权限校验的审批详情和主数据快照。"""
+    return await service.get_detail(approval_id, auth_context)
 
 
 @router.post("/{approval_id}/submit", response_model=SubmitApprovalResponse)

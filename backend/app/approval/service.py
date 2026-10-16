@@ -7,26 +7,325 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.approval.errors import ApprovalError, ApprovalErrorCode
 from app.approval.repository import ApprovalRepository
-from app.approval.schemas import ApprovalActionResponse, SubmitApprovalResponse
+from app.approval.schemas import (
+    ApprovalActionResponse,
+    ApprovalDetailResponse,
+    ApprovalHistoryItem,
+    ApprovalHistoryResponse,
+    ApprovalListItem,
+    ApprovalListResponse,
+    MasterDataChangeDetail,
+    SubmitApprovalResponse,
+)
 from app.auth.context import AuthContext
 from app.domain.approval.context import RejectTargetType, TransitionContext
 from app.domain.approval.enums import ApprovalAction, ApprovalStatus, BusinessType
 from app.domain.approval.errors import ApprovalTransitionError, ApprovalTransitionErrorCode
 from app.domain.approval.state_machine import decide_transition
-from app.domain.workflow.definition import WorkflowDefinitionSpec
+from app.domain.auth.enums import UserRole
+from app.domain.workflow.definition import WorkflowDefinitionSpec, WorkflowNodeDefinition
 from app.domain.workflow.errors import WorkflowDefinitionError
 from app.models.approval import ApprovalApplication, ApprovalRecord
+from app.models.master_data import MasterDataChange
 from app.workflow.repository import WorkflowDefinitionRepository
 
 
 class ApprovalService:
-    """在一个数据库事务中完成审批申请的首次提交或重新提交。"""
+    """协调审批申请写操作及只读查询，并通过 Repository 访问持久化数据。"""
 
     def __init__(self, session: AsyncSession) -> None:
         """绑定请求独享会话并构造不拥有事务边界的 Repository。"""
         self._session = session
         self._repository = ApprovalRepository(session)
         self._workflow_repository = WorkflowDefinitionRepository(session)
+
+    async def list_my_approvals(
+        self,
+        auth_context: AuthContext,
+        *,
+        status: ApprovalStatus | None,
+        limit: int,
+        offset: int,
+    ) -> ApprovalListResponse:
+        """只列出当前申请人自己的审批，并以 limit-plus-one 计算分页状态。"""
+        rows = await self._repository.list_by_applicant(
+            str(auth_context.user_id), status=status, limit=limit, offset=offset
+        )
+        has_more = len(rows) > limit
+        workflow_cache: dict[tuple[str, int], WorkflowDefinitionSpec | None] = {}
+        items = [
+            await self._to_list_item(row, workflow_cache=workflow_cache) for row in rows[:limit]
+        ]
+        return ApprovalListResponse(items=items, limit=limit, offset=offset, has_more=has_more)
+
+    async def list_pending_approvals(
+        self, auth_context: AuthContext, *, limit: int, offset: int
+    ) -> ApprovalListResponse:
+        """校验全部审批中候选的完整性及分配资格后再稳定排序分页。"""
+        candidates = await self._repository.list_in_approval_candidates()
+        task_ids = [row.current_task_id for row in candidates if row.current_task_id]
+        assignments = await self._repository.list_task_creation_records(task_ids)
+        eligible: list[tuple[ApprovalApplication, UserRole]] = []
+        workflow_cache: dict[tuple[str, int], WorkflowDefinitionSpec | None] = {}
+        actor_id = str(auth_context.user_id)
+
+        for approval in candidates:
+            self._validate_business_link(approval)
+            spec, node = await self._resolve_bound_current_node(
+                approval, workflow_cache=workflow_cache
+            )
+            if (
+                spec is None
+                or node is None
+                or not approval.workflow_instance_id
+                or not approval.current_task_id
+                or not approval.submitted_at
+            ):
+                raise ApprovalError(ApprovalErrorCode.DATA_INTEGRITY_ERROR)
+            assignment = assignments.get(approval.current_task_id)
+            if assignment is None or assignment.approval_id != approval.id:
+                raise ApprovalError(ApprovalErrorCode.DATA_INTEGRITY_ERROR)
+            if node.role not in auth_context.roles:
+                continue
+            if (
+                assignment.target_operator_id is not None
+                and assignment.target_operator_id != actor_id
+            ):
+                continue
+            eligible.append((approval, node.role))
+
+        eligible.sort(
+            key=lambda item: (
+                item[0].submitted_at,
+                item[0].created_at,
+                item[0].id,
+            )
+        )
+        page = eligible[offset : offset + limit + 1]
+        has_more = len(page) > limit
+        items = [
+            self._make_list_item(approval, change_role=role) for approval, role in page[:limit]
+        ]
+        return ApprovalListResponse(items=items, limit=limit, offset=offset, has_more=has_more)
+
+    async def get_detail(
+        self, approval_id: UUID, auth_context: AuthContext
+    ) -> ApprovalDetailResponse:
+        """授权后返回申请及其数据库中保存的结构化主数据变更快照。"""
+        approval, change, current_node = await self._load_readable_approval(
+            approval_id, auth_context
+        )
+        return ApprovalDetailResponse(
+            approval_id=approval.id,
+            business_type=approval.business_type,
+            business_id=approval.business_id,
+            applicant_id=approval.applicant_id,
+            status=approval.status,
+            workflow_code=approval.workflow_code,
+            workflow_version=approval.workflow_version,
+            workflow_instance_id=approval.workflow_instance_id,
+            current_node_code=approval.current_node_code,
+            current_node_role=current_node.role if current_node is not None else None,
+            submitted_at=approval.submitted_at,
+            completed_at=approval.completed_at,
+            created_at=approval.created_at,
+            updated_at=approval.updated_at,
+            version=approval.version,
+            change=MasterDataChangeDetail(
+                change_id=change.id,
+                entity_type=change.entity_type,
+                entity_key=change.entity_key,
+                before_data=change.before_data,
+                form_data=change.form_data,
+                change_items=change.change_items,
+                change_reason=change.change_reason,
+                base_entity_version=change.base_entity_version,
+                created_at=change.created_at,
+                updated_at=change.updated_at,
+            ),
+        )
+
+    async def get_history(
+        self, approval_id: UUID, auth_context: AuthContext
+    ) -> ApprovalHistoryResponse:
+        """复用详情读取权限并按时间顺序返回安全的审批动作快照。"""
+        approval, _change, _node = await self._load_readable_approval(approval_id, auth_context)
+        records = await self._repository.list_records(approval.id)
+        self._validate_history(approval, records)
+        return ApprovalHistoryResponse(
+            items=[
+                ApprovalHistoryItem(
+                    record_id=record.id,
+                    operator_id=record.operator_id,
+                    action=record.action,
+                    comment=record.comment,
+                    from_status=record.from_status,
+                    to_status=record.to_status,
+                    from_node_code=record.from_node_code,
+                    from_node_name=record.from_node_name,
+                    target_node_code=record.target_node_code,
+                    target_node_name=record.target_node_name,
+                    created_at=record.created_at,
+                )
+                for record in records
+            ]
+        )
+
+    async def _load_readable_approval(
+        self, approval_id: UUID, auth_context: AuthContext
+    ) -> tuple[ApprovalApplication, MasterDataChange, WorkflowNodeDefinition | None]:
+        """读取并完整性校验申请，再通过统一策略授权详情与历史访问。"""
+        approval = await self._repository.get_application_for_read(approval_id)
+        if approval is None:
+            raise ApprovalError(ApprovalErrorCode.NOT_FOUND)
+        change = self._validate_business_link(approval)
+        assignment = None
+        if approval.status is ApprovalStatus.IN_APPROVAL:
+            _spec, node, assignment = await self._validate_current_task(approval)
+        else:
+            _spec, node = await self._resolve_bound_current_node(approval)
+
+        actor_id = str(auth_context.user_id)
+        if actor_id == approval.applicant_id:
+            return approval, change, node
+        if approval.status is ApprovalStatus.DRAFT:
+            raise ApprovalError(ApprovalErrorCode.FORBIDDEN)
+
+        if (
+            approval.status is ApprovalStatus.IN_APPROVAL
+            and node is not None
+            and assignment is not None
+        ):
+            is_current_reviewer = node.role in auth_context.roles and (
+                assignment.target_operator_id is None or assignment.target_operator_id == actor_id
+            )
+            if is_current_reviewer:
+                return approval, change, node
+
+        reviewer_roles = {UserRole.APPROVER, UserRole.DATA_ADMIN}
+        if approval.status in {
+            ApprovalStatus.IN_APPROVAL,
+            ApprovalStatus.COMPLETED,
+        } and auth_context.roles.intersection(reviewer_roles):
+            latest_submit = await self._repository.find_latest_submit_record(approval.id)
+            if latest_submit is None:
+                raise ApprovalError(ApprovalErrorCode.DATA_INTEGRITY_ERROR)
+            if await self._repository.has_reviewer_participated_since(
+                approval.id, actor_id, latest_submit
+            ):
+                return approval, change, node
+        raise ApprovalError(ApprovalErrorCode.FORBIDDEN)
+
+    async def _validate_current_task(
+        self, approval: ApprovalApplication
+    ) -> tuple[WorkflowDefinitionSpec, WorkflowNodeDefinition, ApprovalRecord]:
+        """验证审批中申请的精确流程、运行时字段和当前 task 历史关联。"""
+        spec, node = await self._resolve_bound_current_node(approval)
+        if (
+            spec is None
+            or node is None
+            or not approval.workflow_instance_id
+            or not approval.current_task_id
+            or not approval.submitted_at
+        ):
+            raise ApprovalError(ApprovalErrorCode.DATA_INTEGRITY_ERROR)
+        assignment = await self._repository.get_task_creation_record(approval.current_task_id)
+        if assignment is None or assignment.approval_id != approval.id:
+            raise ApprovalError(ApprovalErrorCode.DATA_INTEGRITY_ERROR)
+        return spec, node, assignment
+
+    async def _resolve_bound_current_node(
+        self,
+        approval: ApprovalApplication,
+        *,
+        workflow_cache: dict[tuple[str, int], WorkflowDefinitionSpec | None] | None = None,
+    ) -> tuple[WorkflowDefinitionSpec | None, WorkflowNodeDefinition | None]:
+        """校验流程绑定配对并从精确版本解析可选当前节点。"""
+        code, version = approval.workflow_code, approval.workflow_version
+        if (code is None) != (version is None):
+            raise ApprovalError(ApprovalErrorCode.DATA_INTEGRITY_ERROR)
+        if approval.current_node_code is None:
+            return None, None
+        if code is None or version is None:
+            raise ApprovalError(ApprovalErrorCode.DATA_INTEGRITY_ERROR)
+        try:
+            key = (code, version)
+            if workflow_cache is not None and key in workflow_cache:
+                spec = workflow_cache[key]
+            else:
+                spec = await self._workflow_repository.get_by_code_version(code, version)
+                if workflow_cache is not None:
+                    workflow_cache[key] = spec
+            if spec is None:
+                raise ApprovalError(ApprovalErrorCode.DATA_INTEGRITY_ERROR)
+            return spec, spec.get_node(approval.current_node_code)
+        except WorkflowDefinitionError as error:
+            raise ApprovalError(ApprovalErrorCode.DATA_INTEGRITY_ERROR) from error
+
+    async def _to_list_item(
+        self,
+        approval: ApprovalApplication,
+        *,
+        workflow_cache: dict[tuple[str, int], WorkflowDefinitionSpec | None],
+    ) -> ApprovalListItem:
+        """校验列表行的业务和流程关联后转换为摘要响应。"""
+        self._validate_business_link(approval)
+        _spec, node = await self._resolve_bound_current_node(
+            approval, workflow_cache=workflow_cache
+        )
+        return self._make_list_item(approval, change_role=node.role if node is not None else None)
+
+    @staticmethod
+    def _validate_business_link(approval: ApprovalApplication) -> MasterDataChange:
+        """确保申请严格关联唯一的主数据变更对象。"""
+        change = approval.master_data_change
+        if (
+            approval.business_type is not BusinessType.MASTER_DATA_CHANGE
+            or change is None
+            or approval.business_id != str(change.id)
+        ):
+            raise ApprovalError(ApprovalErrorCode.DATA_INTEGRITY_ERROR)
+        return change
+
+    @staticmethod
+    def _make_list_item(
+        approval: ApprovalApplication, *, change_role: UserRole | None
+    ) -> ApprovalListItem:
+        """将申请及已解析节点角色转换为不暴露 task 的列表摘要。"""
+        change = approval.master_data_change
+        if change is None:
+            raise ApprovalError(ApprovalErrorCode.DATA_INTEGRITY_ERROR)
+        return ApprovalListItem(
+            approval_id=approval.id,
+            business_type=approval.business_type,
+            status=approval.status,
+            applicant_id=approval.applicant_id,
+            entity_type=change.entity_type,
+            entity_key=change.entity_key,
+            change_reason=change.change_reason,
+            workflow_code=approval.workflow_code,
+            workflow_version=approval.workflow_version,
+            current_node_code=approval.current_node_code,
+            current_node_role=change_role,
+            submitted_at=approval.submitted_at,
+            completed_at=approval.completed_at,
+            created_at=approval.created_at,
+            updated_at=approval.updated_at,
+            version=approval.version,
+        )
+
+    @staticmethod
+    def _validate_history(approval: ApprovalApplication, records: list[ApprovalRecord]) -> None:
+        """拒绝已进入审批但缺少提交或必要动作事实的损坏历史。"""
+        if approval.status is ApprovalStatus.DRAFT:
+            if not records and approval.workflow_code is not None:
+                raise ApprovalError(ApprovalErrorCode.DATA_INTEGRITY_ERROR)
+            return
+        actions = {record.action for record in records}
+        if ApprovalAction.SUBMIT not in actions:
+            raise ApprovalError(ApprovalErrorCode.DATA_INTEGRITY_ERROR)
+        if approval.status is ApprovalStatus.COMPLETED and ApprovalAction.APPROVE not in actions:
+            raise ApprovalError(ApprovalErrorCode.DATA_INTEGRITY_ERROR)
 
     async def submit(self, approval_id: UUID, auth_context: AuthContext) -> SubmitApprovalResponse:
         """验证并提交申请，绑定流程版本、初始化首节点并追加 SUBMIT 历史。"""
